@@ -73,6 +73,9 @@ pub struct ProbeControl {
 
     large_drop: Option<LargeDrop>,
 
+    /// WebRTC: `last_bwe_drop_probing_time_`.
+    last_large_drop_probe: Option<Instant>,
+
     last_stagnant: Option<Instant>,
 
     next_cluster_id: TwccClusterId,
@@ -113,6 +116,7 @@ impl Default for ProbeControl {
             next_cluster_id: 0.into(),
             last_probe: None,
             large_drop: None,
+            last_large_drop_probe: None,
             last_stagnant: None,
             pending: VecDeque::new(),
             scheduled_exponential: None,
@@ -140,6 +144,7 @@ impl ProbeControl {
             self.last_estimate_change = None;
             self.last_stagnant = None;
             self.last_probe = None;
+            self.last_large_drop_probe = None;
             self.prev_estimate = None;
             self.scheduled_exponential = None;
             self.scheduled_periodic_alr = None;
@@ -521,14 +526,35 @@ impl ProbeControl {
             return false;
         }
 
-        // Respect minimum interval between ALR probes.
-        if self.time_since_last_probe(now) < MIN_TIME_BETWEEN_ALR_PROBES {
+        // Probe at 85% of pre-drop bitrate.
+        let target = drop.bitrate_before * PROBE_FRACTION_AFTER_DROP;
+
+        // Not if the estimate has recovered to what the probe is expected to measure.
+        if estimate >= target * (1.0 - PROBE_UNCERTAINTY) {
             return false;
         }
 
-        // Probe at 85% of pre-drop bitrate.
-        let target = drop.bitrate_before * PROBE_FRACTION_AFTER_DROP;
+        // Respect minimum interval between drop probes. As WebRTC, this is the time since
+        // the last drop probe, not since any probe: a periodic ALR probe just before the
+        // drop would otherwise hold it back until the ALR-ended timeout has passed.
+        let since_drop_probe = self
+            .last_large_drop_probe
+            .map(|t| now.saturating_duration_since(t))
+            .unwrap_or(Duration::MAX);
+        if since_drop_probe < MIN_TIME_BETWEEN_ALR_PROBES {
+            return false;
+        }
+
         self.queue_probe(target, ProbeKind::LargeDrop, desired, now);
+        // WebRTC probes after a drop without probing further.
+        if let Some(last) = self
+            .last_probe
+            .as_mut()
+            .filter(|p| p.kind == ProbeKind::LargeDrop)
+        {
+            last.further = Bitrate::INFINITY;
+        }
+        self.last_large_drop_probe = Some(now);
 
         self.large_drop = None;
         true
@@ -1121,5 +1147,119 @@ mod test {
             probe.is_some(),
             "Should continue periodic probing in ALR even when estimate >= max_bitrate"
         );
+    }
+
+    #[test]
+    fn large_drop_probe_soon_after_periodic_alr_probe() {
+        // As libWebRTC's RequestProbe (test RequestProbeInAlr): the drop probe is limited by
+        // the time since the last drop probe, not since any probe. A periodic ALR probe
+        // raises the estimate, which ends ALR; a short overuse 0.5 s later cuts the estimate
+        // to 0.85 x an app-limited acked rate. The drop probe must go out when the overuse
+        // is over, within the ALR-ended timeout.
+        let mut pc = ProbeControl::new();
+        pc.enable(true);
+        let now = Instant::now();
+        let at = |ms: u64| now + Duration::from_millis(ms);
+
+        pc.set_desired_bitrate(Bitrate::kbps(14_720));
+        pc.set_estimated_bitrate(
+            Bitrate::kbps(4_460),
+            BandwidthLimitedCause::DelayBasedLimited,
+        );
+        let _ = pc.handle_timeout(now);
+        let _ = pc.handle_timeout(now);
+        assert!(pc.handle_timeout(at(2_000)).is_none());
+        pc.set_alr_start_time(at(2_000));
+
+        let p = pc.handle_timeout(at(5_000)).unwrap();
+        assert!(p.is_alr_probe());
+
+        // Probe result, then ALR ends (the estimate rose above the sender's rate / 0.65).
+        pc.set_estimated_bitrate(
+            Bitrate::kbps(8_700),
+            BandwidthLimitedCause::DelayBasedLimited,
+        );
+        assert!(pc.handle_timeout(at(5_100)).is_none());
+        pc.set_alr_stop_time(at(5_300));
+        assert!(pc.handle_timeout(at(5_300)).is_none());
+
+        // Overuse: cut to 3.2 Mbit/s, no probes while it lasts.
+        pc.set_estimated_bitrate(
+            Bitrate::kbps(3_200),
+            BandwidthLimitedCause::DelayBasedLimitedDelayIncreased,
+        );
+        assert!(pc.handle_timeout(at(5_500)).is_none());
+
+        // Overuse over: the drop probe at 0.85 x the pre-drop estimate.
+        pc.set_estimated_bitrate(
+            Bitrate::kbps(3_300),
+            BandwidthLimitedCause::DelayBasedLimited,
+        );
+        let mut probe = None;
+        for ms in (5_900..=20_000).step_by(100) {
+            // As SendSideBandwidthEstimator::handle_timeout, every tick.
+            pc.set_desired_bitrate(Bitrate::kbps(14_720));
+            if let Some(p) = pc.handle_timeout(at(ms)) {
+                probe = Some((ms, p));
+                break;
+            }
+        }
+        let (ms, p) = probe.expect("no probe after the drop");
+        assert_eq!(ms, 5_900);
+        assert_eq!(
+            p.target_bitrate(),
+            Bitrate::kbps(8_700) * PROBE_FRACTION_AFTER_DROP
+        );
+        assert!(!p.is_alr_probe());
+
+        // As WebRTC, no further probing after a drop probe.
+        pc.set_estimated_bitrate(
+            Bitrate::kbps(7_300),
+            BandwidthLimitedCause::DelayBasedLimited,
+        );
+        assert!(pc.handle_timeout(at(6_100)).is_none());
+    }
+
+    #[test]
+    fn no_large_drop_probe_once_estimate_has_recovered() {
+        // As libWebRTC's RequestProbe: no drop probe when the estimate is already at what
+        // the probe is expected to measure, (1 - kProbeUncertainty) x the probe rate.
+        let mut pc = ProbeControl::new();
+        pc.enable(true);
+        let now = Instant::now();
+        let at = |ms: u64| now + Duration::from_millis(ms);
+        let est = |pc: &mut ProbeControl, kbps: u64| {
+            pc.set_estimated_bitrate(
+                Bitrate::kbps(kbps),
+                BandwidthLimitedCause::DelayBasedLimited,
+            )
+        };
+
+        pc.set_desired_bitrate(Bitrate::mbps(20));
+        est(&mut pc, 10_000);
+        let _ = pc.handle_timeout(now);
+        let _ = pc.handle_timeout(now);
+        assert!(pc.handle_timeout(at(2_000)).is_none());
+        pc.set_alr_start_time(at(2_000));
+        assert!(pc.handle_timeout(at(2_000)).is_none());
+
+        // A first drop is probed at once and recovers.
+        est(&mut pc, 5_000);
+        let p = pc.handle_timeout(at(2_200)).unwrap();
+        assert_eq!(p.target_bitrate(), Bitrate::kbps(8_500));
+        est(&mut pc, 10_000);
+        assert!(pc.handle_timeout(at(2_300)).is_none());
+
+        // A second drop waits for the minimum time between drop probes (until 7.2 s), and
+        // by then the estimate is at 8.1 Mbit/s: above 0.95 x the 8.5 Mbit/s probe.
+        est(&mut pc, 5_000);
+        assert!(pc.handle_timeout(at(4_000)).is_none());
+        pc.set_alr_stop_time(at(4_500));
+        assert!(pc.handle_timeout(at(4_500)).is_none());
+        est(&mut pc, 8_100);
+        for ms in (6_000..=9_500).step_by(100) {
+            pc.set_desired_bitrate(Bitrate::mbps(20));
+            assert!(pc.handle_timeout(at(ms)).is_none(), "probe at {ms} ms");
+        }
     }
 }

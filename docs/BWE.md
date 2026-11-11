@@ -369,9 +369,12 @@ concepts are unified into this single value.
 
 4. **Large-Drop Recovery**: After a bitrate drop to 66% or below
    (`BITRATE_DROP_THRESHOLD`), if the drop occurred within 5 seconds
-   (`BITRATE_DROP_TIMEOUT`) and at least 5 seconds have passed since the
-   last recovery probe (`MIN_TIME_BETWEEN_ALR_PROBES`), probes at 85% of
-   the pre-drop rate (`PROBE_FRACTION_AFTER_DROP`). Only active when in
+   (`BITRATE_DROP_TIMEOUT`), at least 5 seconds have passed since the
+   last large-drop probe (`MIN_TIME_BETWEEN_ALR_PROBES`; other probes do
+   not count) and the estimate is still below 95% of the probe rate
+   (`PROBE_UNCERTAINTY`), probes at 85% of the pre-drop rate
+   (`PROBE_FRACTION_AFTER_DROP`), without further probing from its result,
+   as WebRTC's `RequestProbe`. Only active when in
    ALR or within 3 seconds after leaving ALR (`ALR_ENDED_TIMEOUT`). This
    recovers from temporary network glitches—if we suddenly dropped due to
    transient congestion but are now in ALR (low utilization), it's worth
@@ -745,15 +748,15 @@ transmission smoothing and padding generation respectively.
 
 ### Deviations
 
-1. **Exponential Probing After All Probe Types:**
+1. **Exponential Probing After Most Probe Types:**
    - **WebRTC**: Further probing depends on the probe's `probe_further` flag.
      Startup, periodic ALR and network-state probes allow it; allocation
      probes allow it when capped by the current estimate. Large-drop
      recovery probes do not allow further probing
-   - **str0m**: Any probe type can lead to exponential probing when its
-     result exceeds 70% of the target rate
-   - **Impact**: Capacity discovery can continue after large-drop recovery
-     and stagnation probes as well as startup and ALR probes
+   - **str0m**: Any probe type except large-drop recovery can lead to
+     exponential probing when its result exceeds 70% of the target rate
+   - **Impact**: Capacity discovery can continue after stagnation and
+     allocation probes as well as startup and ALR probes
 
 2. **Stagnant Estimate Probing:**
    - **WebRTC**: None (relies on large-drop recovery with ALR requirement, or

@@ -1,5 +1,6 @@
 # Unreleased
 
+  * Space large-drop probes from the last drop probe, as libwebrtc does
   * Fix the unit of the average packet size in the delay-based additive increase
   * Bound the loss-based estimate below by the acked bitrate, as libwebrtc does
   * Bound the acked bitrate's sample uncertainty for increases, so it recovers after a media gap

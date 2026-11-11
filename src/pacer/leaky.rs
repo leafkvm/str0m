@@ -323,10 +323,10 @@ impl LeakyBucketPacer {
 
         // If we're actively probing, use probe timing for padding
         if let Some(probe) = self.probe_queue.front() {
-            let next_probe_time = probe.next_probe_time();
+            let next_request_time = probe.next_request_time();
             // We explicitly don't return a queue to poll here. We need another call to
             // handle_timeout to request the padding before we can poll the selected queue.
-            return Some(((next_probe_time, PacerReason::Probe2), None));
+            return Some(((next_request_time, PacerReason::Probe2), None));
         }
 
         if self.padding_bitrate == Bitrate::ZERO {
@@ -522,6 +522,43 @@ mod test {
                 .handle_timeout(deadline, std::iter::once(queue))
                 .is_some()
         );
+    }
+
+    #[test]
+    fn probe_behind_schedule_waits_for_the_next_padding_request() {
+        use crate::bwe_::ProbeKind;
+
+        // A 60 Mbps cluster requests 15 000 bytes (2 ms) at a time. A late timeout puts the
+        // cluster behind its rate schedule: the next packet is due at once, but the next
+        // padding request only `min_probe_delta` after the last one. Without media queued,
+        // the pacer must wait for that request rather than poll in the past.
+        let start = Instant::now();
+        let mut pacer = LeakyBucketPacer::new(Bitrate::kbps(300));
+        let queue = QueueState {
+            midrid: MidRid("probe".into(), None),
+            unpaced: false,
+            use_for_padding: true,
+            snapshot: QueueSnapshot {
+                created_at: start,
+                ..Default::default()
+            },
+        };
+        pacer.handle_timeout(start, std::iter::once(queue));
+        pacer.start_probe(ProbeClusterConfig::new(
+            0.into(),
+            Bitrate::mbps(60),
+            ProbeKind::Initial,
+        ));
+        for now in [start, start + Duration::from_millis(5)] {
+            let request = pacer.handle_timeout(now, std::iter::once(queue)).unwrap();
+            assert_eq!(request.padding, 15_000);
+            let (midrid, _) = pacer.poll_queue().unwrap();
+            pacer.register_send(now, request.padding.into(), midrid);
+        }
+        let now = start + Duration::from_millis(5);
+        assert!(pacer.handle_timeout(now, std::iter::once(queue)).is_none());
+        let (deadline, _) = pacer.poll_timeout();
+        assert_eq!(deadline, Some(now + Duration::from_millis(2)));
     }
 
     #[test]

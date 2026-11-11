@@ -30,10 +30,11 @@ pub struct ProbeClusterConfig {
     /// This ensures statistical validity even for short bursts.
     min_packet_count: usize,
 
-    /// Delta time between sent bursts of packets during probe.
+    /// Delta time between padding bursts during probe.
     ///
-    /// Mirrors WebRTC's `ProbeClusterConfig.min_probe_delta`. The pacer/probe sender must not
-    /// schedule probe packets more frequently than this.
+    /// Mirrors WebRTC's `ProbeClusterConfig.min_probe_delta`. The pacer requests a padding burst
+    /// of `target_bitrate × min_probe_delta` no more often than this; the packets of a burst
+    /// leave by the rate schedule (`next_probe_time()`), not this spacing.
     min_probe_delta: Duration,
 
     /// The kind of probe this is.
@@ -191,10 +192,18 @@ impl ProbeClusterState {
         // Packet-level pacing: schedule based on bytes sent at the target bitrate.
         // next_time = start_time + (bytes_sent / target_bitrate)
         let send_duration = self.bytes_sent / self.config.target_bitrate;
-        let probe_time = started_at + send_duration;
+        started_at + send_duration
+    }
 
+    /// When the next padding burst may be requested: `next_probe_time()`, but at least
+    /// `min_probe_delta` after the previous request.
+    ///
+    /// The `min_probe_delta` gate is not part of `next_probe_time()`: the pacer also releases
+    /// queued packets of the cluster by `next_probe_time()`, and a burst that was just
+    /// requested must leave at once, not `min_probe_delta` later.
+    pub fn next_request_time(&self) -> Instant {
         let min_burst_time = self.last_padding_at + self.config.min_probe_delta();
-        probe_time.max(min_burst_time)
+        self.next_probe_time().max(min_burst_time)
     }
 
     /// Check if the probe cluster is complete.
@@ -220,13 +229,11 @@ impl ProbeClusterState {
         bytes_met && packets_met
     }
 
-    /// Check if it's time to send the next probe packet.
+    /// Check if it's time to request the next probe burst.
     ///
-    /// Returns `true` if `now >= next_probe_time()`, meaning we should send a packet now.
+    /// Returns `true` if `now >= next_request_time()`, meaning we should request padding now.
     pub fn should_send_now(&self, now: Instant) -> bool {
-        let next_time = self.next_probe_time();
-        let min_burst_time = self.last_padding_at + self.config.min_probe_delta();
-        now >= next_time && now >= min_burst_time
+        now >= self.next_request_time()
     }
 
     /// Calculate how much padding should be generated for the next probe packet.
@@ -311,7 +318,7 @@ impl ProbeClusterState {
     pub fn record_packet(&mut self, now: Instant, size: DataSize) {
         // If a probe is active and we observe a media packet before any probe-generated padding,
         // treat that as the start of the probe. This keeps timing semantics consistent and ensures
-        // `next_probe_time()` enforces `min_probe_delta` from the first packet onwards.
+        // `next_request_time()` enforces `min_probe_delta` from the first packet onwards.
         if self.started_at.is_none() {
             self.started_at = Some(now);
         }
@@ -435,7 +442,30 @@ mod test {
     }
 
     #[test]
-    fn min_probe_delta_is_enforced_in_next_probe_time() {
+    fn requested_burst_is_released_at_once() {
+        // 60 Mbit/s: a burst of 60 Mbit/s x 2 ms = 15 000 bytes per request.
+        let now = Instant::now();
+        let config = ProbeClusterConfig::new(1.into(), Bitrate::mbps(60), ProbeKind::Initial);
+        let mut state = ProbeClusterState::new(config);
+        let burst = state.next_packet(now).expect("first burst");
+        assert_eq!(burst, DataSize::bytes(15_000));
+
+        // The burst is queued as packets that the pacer releases by `next_probe_time()`.
+        // Halfway through the burst the next packet is due at the rate schedule, not held
+        // until `min_probe_delta` after the request.
+        state.record_packet(now, DataSize::bytes(7_500));
+        assert_eq!(state.next_probe_time(), now + Duration::from_millis(1));
+        assert_eq!(state.next_request_time(), now + Duration::from_millis(2));
+        assert!(!state.should_send_now(now + Duration::from_millis(1)));
+
+        // The next burst is requested `min_probe_delta` after the previous request.
+        state.record_packet(now + Duration::from_millis(1), DataSize::bytes(7_500));
+        assert_eq!(state.next_request_time(), now + Duration::from_millis(2));
+        assert!(state.should_send_now(now + Duration::from_millis(2)));
+    }
+
+    #[test]
+    fn min_probe_delta_is_enforced_between_padding_requests() {
         let now = Instant::now();
         let config = ProbeClusterConfig::new(1.into(), Bitrate::mbps(3), ProbeKind::Initial)
             .with_min_probe_delta(Duration::from_millis(20));
@@ -446,10 +476,10 @@ mod test {
         assert!(state.next_packet(now).is_some());
         assert!(state.next_packet(now + Duration::from_millis(19)).is_none());
         assert!(state.next_packet(now + Duration::from_millis(20)).is_some());
-        let next = state.last_padding_at;
+        let next = state.next_request_time();
         assert!(
-            next >= now + Duration::from_millis(20),
-            "next_probe_time {next:?} must be >= now + min_probe_delta"
+            next >= now + Duration::from_millis(40),
+            "next_request_time {next:?} must be >= the last request + min_probe_delta"
         );
     }
 }

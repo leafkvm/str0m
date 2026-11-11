@@ -1,5 +1,6 @@
 # Unreleased
 
+  * Release a requested probe burst at once, not `min_probe_delta` after the request
   * Space large-drop probes from the last drop probe, as libwebrtc does
   * Fix the unit of the average packet size in the delay-based additive increase
   * Bound the loss-based estimate below by the acked bitrate, as libwebrtc does

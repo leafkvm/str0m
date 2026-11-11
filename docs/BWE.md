@@ -450,15 +450,15 @@ probe at, the `target_duration` to sustain (default 15ms), the
 WebRTC's `ProbeClusterConfig` structure and defaults.
 
 `ProbeClusterState` handles runtime tracking during probe execution,
-monitoring bytes and packets sent while calculating the next probe time
-based on both the target bitrate pacing and the `min_probe_delta`
-constraint. The `min_probe_delta` enforces a minimum spacing between probe
-packet bursts, preventing probes from overwhelming receiver buffers with
-back-to-back packets—even high-speed networks need time to process and
-feedback packet arrivals. When requesting padding for a burst, the state
-calculates `burst_bytes = target_bitrate × min_probe_delta` to ensure each
-burst is large enough to achieve the target rate given the spacing
-constraint.
+monitoring bytes and packets sent. The next probe time
+(`next_probe_time()`) follows the target bitrate alone,
+`start + bytes_sent / target_bitrate`, as WebRTC's
+`BitrateProber::CalculateNextProbeTime`; the pacer releases the cluster's
+queued packets by it. The `min_probe_delta` spaces the padding requests
+(`next_request_time()`): each requests a burst of
+`burst_bytes = target_bitrate × min_probe_delta`, large enough to achieve
+the target rate given that spacing, and a requested burst leaves at once
+rather than `min_probe_delta` after its request.
 
 Completion occurs when both thresholds are met: sent bytes must equal or
 exceed `target_bitrate × target_duration`, and sent packets must equal or

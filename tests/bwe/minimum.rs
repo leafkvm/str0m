@@ -6,11 +6,14 @@ use netem::{DataSize, NetemConfig};
 use str0m::RtcError;
 use str0m::bwe::Bitrate;
 
-use crate::common::{BweTestContext, connect_with_bwe, init_crypto_default, init_log};
+use crate::common::{BweTestContext, connect_with_bwe_smoothing, init_crypto_default, init_log};
 
 fn recovery_time(minimum: Bitrate) -> Result<Duration, RtcError> {
     let desired = Bitrate::mbps(5);
-    let (mut l, mut r) = connect_with_bwe(Bitrate::mbps(2), desired);
+    // The unsmoothed estimate: the 3 s mean averages the distinct estimates of the window
+    // regardless of how long each held, so when it crosses 2 Mbps depends on how many small
+    // steps the estimate took, not only on how fast it recovered.
+    let (mut l, mut r) = connect_with_bwe_smoothing(Bitrate::mbps(2), desired, false);
     let mut ctx = BweTestContext::new(&mut l, &mut r);
 
     let good = NetemConfig::new()

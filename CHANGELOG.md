@@ -1,5 +1,6 @@
 # Unreleased
 
+  * Put the local ICE candidates on the first BUNDLE m-line that is not rejected
   * Request a keyframe when a NACK names a packet that is no longer cached
   * Forward a changed bandwidth-limited cause to the probe controller with an unchanged estimate
   * Release a requested probe burst at once, not `min_probe_delta` after the request

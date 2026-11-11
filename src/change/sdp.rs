@@ -821,10 +821,7 @@ fn as_sdp(session: &Session, params: AsSdpParams) -> Sdp {
         let mut lines = v
             .iter()
             .map(|m| {
-                // Candidates should only be in the first BUNDLE mid
-                let include_candidates = m.index() == 0;
-
-                let attrs = params.media_attributes(include_candidates);
+                let attrs = params.media_attributes();
 
                 // Already made send stream SSRCs
                 let mut ssrcs = session.streams.ssrcs_tx(m.mid());
@@ -859,6 +856,20 @@ fn as_sdp(session: &Session, params: AsSdpParams) -> Sdp {
 
         if let Some(pending) = params.pending {
             pending.apply_to(&mut lines);
+        }
+
+        // Codec negotiation or pending changes can reject the first m-line.
+        // Only the first active BUNDLE section carries the ICE candidates;
+        // candidates on a rejected section are ignored by browsers.
+        if let Some(line) = lines.iter_mut().find(|line| !line.disabled) {
+            line.attrs.splice(
+                0..0,
+                params
+                    .candidates
+                    .iter()
+                    .cloned()
+                    .map(sdp::MediaAttribute::Candidate),
+            );
         }
 
         // Mids go into the session part of the SDP.
@@ -1632,25 +1643,16 @@ impl<'a, 'b> AsSdpParams<'a, 'b> {
         }
     }
 
-    fn media_attributes(&self, include_candidates: bool) -> Vec<MediaAttribute> {
+    fn media_attributes(&self) -> Vec<MediaAttribute> {
         use MediaAttribute::*;
 
-        let mut v = if include_candidates {
-            self.candidates
-                .iter()
-                .map(|c| Candidate(c.clone()))
-                .collect()
-        } else {
-            vec![]
-        };
-
-        v.push(IceUfrag(self.creds.ufrag.clone()));
-        v.push(IcePwd(self.creds.pass.clone()));
-        v.push(IceOptions("trickle".into()));
-        v.push(Fingerprint(self.fingerprint.clone()));
-        v.push(Setup(self.setup));
-
-        v
+        vec![
+            IceUfrag(self.creds.ufrag.clone()),
+            IcePwd(self.creds.pass.clone()),
+            IceOptions("trickle".into()),
+            Fingerprint(self.fingerprint.clone()),
+            Setup(self.setup),
+        ]
     }
 }
 
@@ -1854,6 +1856,58 @@ mod test {
 
     fn get_setup_from_media_line(line: &MediaLine) -> Setup {
         line.setup().expect("Expected a=setup attribute in SDP")
+    }
+
+    #[test]
+    fn ice_candidates_follow_first_active_bundle_section() {
+        crate::init_crypto_default();
+
+        // Firefox without OpenH264 offers video codecs we cannot send. Audio
+        // and the RPC data channel must still get a usable ICE transport.
+        for (supported_video, audio) in [(false, true), (false, false), (true, true)] {
+            let now = Instant::now();
+            let mut offerer = Rtc::builder()
+                .clear_codecs()
+                .enable_vp8(true)
+                .enable_opus(true, false)
+                .build(now);
+            let mut answerer = Rtc::builder()
+                .clear_codecs()
+                .enable_vp8(supported_video)
+                .enable_h264(true)
+                .enable_opus(true, false)
+                .build(now);
+            let candidate = Candidate::host("127.0.0.1:58000".parse().unwrap(), "udp").unwrap();
+            let candidate = answerer.add_local_candidate(candidate).unwrap().clone();
+
+            let mut changes = offerer.sdp_api();
+            changes.add_media(MediaKind::Video, Direction::RecvOnly, None, None, None);
+            if audio {
+                changes.add_media(MediaKind::Audio, Direction::RecvOnly, None, None, None);
+            }
+            changes.add_channel("rpc".into());
+            let (offer, _) = changes.apply().unwrap();
+            let answer = answerer.sdp_api().accept_offer(offer).unwrap();
+
+            assert_eq!(answer.media_lines[0].disabled, !supported_video);
+            let first_active = answer
+                .media_lines
+                .iter()
+                .position(|line| !line.disabled)
+                .unwrap();
+            assert_eq!(
+                answer.bundle_mids().unwrap()[0],
+                answer.media_lines[first_active].mid()
+            );
+            for (index, line) in answer.media_lines.iter().enumerate() {
+                let candidates: Vec<_> = line.ice_candidates().collect();
+                if index == first_active {
+                    assert_eq!(candidates, vec![&candidate]);
+                } else {
+                    assert!(candidates.is_empty());
+                }
+            }
+        }
     }
 
     /// RFC 8842 §5.2: an offer MUST use a=setup:actpass regardless of DTLS role.

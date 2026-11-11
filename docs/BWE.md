@@ -275,10 +275,21 @@ Provides loss-based bandwidth estimation using Maximum Likelihood Estimation
 to distinguish between inherent packet loss (characteristic of the network
 path—WiFi and cellular networks naturally lose packets even without
 congestion) and congestion-induced loss (packets dropped because queues
-are full). The controller operates in three states: DelayBased (deferring
+are full). The controller operates in four states: DelayBased (deferring
 to the delay controller), Decreasing (actively limiting bandwidth due to
-detected loss-based congestion), and Increasing (recovering after loss
-conditions improve).
+detected loss-based congestion), IncreaseUsingPadding (recovering after
+loss conditions improve, with the pacer padding up to the estimate), and
+Increasing (the same without padding, used only when the padding duration
+is configured to zero, as in libwebrtc).
+
+While loss limited, an increase is capped at 1.2-1.5× the acknowledged
+bitrate. An application-limited sender only gets acknowledged what it
+chooses to send, so its estimate could not recover from a loss burst
+without a probe. As libwebrtc's `kIncreaseUsingPadding`, the pacer
+therefore pads up to the loss-based estimate (see Pacer Control) while it
+keeps reaching new highs, and for a padding duration of 2 seconds after
+the last one; then the state falls to Decreasing with a new HOLD. No
+probes are sent in this state.
 
 The controller estimates the inherent loss rate of the link over an
 observation window, establishing a baseline for expected packet loss. When
@@ -406,7 +417,8 @@ The controller blocks probing based on `BandwidthLimitedCause` state to
 avoid making congestion worse:
 
 - **Suppressed entirely** when `DelayBasedLimitedDelayIncreased` (delay
-  increasing) or `LossLimitedBwe` (loss-limited and decreasing): The
+  increasing) or `LossLimitedBwe` (loss-limited and decreasing, or
+  increasing using padding): The
   network is showing clear signs of congestion (increasing queuing delay
   or packet loss). Sending probe bursts would add more traffic to
   already-congested queues, exacerbating the problem and potentially
@@ -716,8 +728,15 @@ capacity to discover; it is not a hard ceiling. The minimum is clamped to
 the desired bitrate. To migrate from `set_desired_bitrate(desired)`, use
 `set_bitrate(Bitrate::ZERO, desired)`.
 
-Regular padding uses `min(max(50 kbps, minimum), estimate)`. The automatic
-50 kbps target maintains NAT bindings and RTX state. Padding is suppressed
+Regular padding uses `min(max(50 kbps, minimum, loss_recovery), estimate)`.
+The automatic 50 kbps target maintains NAT bindings and RTX state.
+`loss_recovery` is `min(estimate, desired)` while the loss controller is in
+IncreaseUsingPadding and zero otherwise: as libwebrtc's `GetPacingRates`
+takes the larger of its padding target and the loss-based target in that
+state, the larger of the minimum and the loss recovery rate applies, both
+capped by the estimate and suppressed during overuse. Unlike libwebrtc, the
+loss recovery padding stays within the desired bitrate, which also bounds
+probes; without a desired bitrate there is no such padding. Padding is suppressed
 during overuse and when there is no active sending media section. Sending
 also requires an available media padding source; SSRC 0 remains restricted
 to authorized probe clusters. Media bytes count against the padding budget,
@@ -777,8 +796,10 @@ transmission smoothing and padding generation respectively.
    - **WebRTC**: Layer/stream requirements and minimum transmit configuration
      supply a padding target, capped by the congestion-controlled rate
    - **str0m**: Configurable minimum transmit target with a 50 kbps floor for
-     active outgoing media, capped by the estimate and suppressed during
-     overuse; authorized probes use separate burst targets
+     active outgoing media, raised to the loss-based estimate (at most the
+     desired bitrate) while the loss controller increases using padding,
+     capped by the estimate and suppressed during overuse; authorized probes
+     use separate burst targets
    - **Reason**: str0m has no encoder or built-in layer allocator
    - **Impact**: Low-rate media can fill toward an application-configured
      traffic target to help discover higher capacity

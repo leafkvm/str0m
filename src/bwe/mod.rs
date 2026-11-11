@@ -132,6 +132,18 @@ impl Bwe {
     pub fn minimum_bitrate(&self) -> Bitrate {
         self.minimum_bitrate
     }
+
+    /// The rate the pacer should pad up to while the loss controller recovers, zero otherwise.
+    pub fn loss_recovery_padding_rate(&self) -> Bitrate {
+        let Some(estimate) = self.bwe.last_estimate() else {
+            return Bitrate::ZERO;
+        };
+        loss_recovery_padding_rate(
+            self.bwe.loss_controller.loss_based_result().state,
+            estimate,
+            self.desired_bitrate,
+        )
+    }
 }
 
 struct SendSideBandwidthEstimator {
@@ -377,7 +389,10 @@ impl SendSideBandwidthEstimator {
             _ if !self.is_loss_limited() => BandwidthLimitedCause::DelayBasedLimited,
             LossControllerState::DelayBased => BandwidthLimitedCause::DelayBasedLimited,
             LossControllerState::Increasing => BandwidthLimitedCause::LossLimitedBweIncreasing,
-            LossControllerState::Decreasing => BandwidthLimitedCause::LossLimitedBwe,
+            // Probes may not be sent while padding raises the estimate (as libWebRTC).
+            LossControllerState::IncreaseUsingPadding | LossControllerState::Decreasing => {
+                BandwidthLimitedCause::LossLimitedBwe
+            }
         }
     }
 
@@ -416,7 +431,9 @@ impl SendSideBandwidthEstimator {
                 // Loss controller defers to delay-based estimate
                 delay_estimate
             }
-            LossControllerState::Decreasing | LossControllerState::Increasing => {
+            LossControllerState::Decreasing
+            | LossControllerState::Increasing
+            | LossControllerState::IncreaseUsingPadding => {
                 // Loss controller is actively limiting or recovering
                 match (delay_estimate, loss_result.bandwidth_estimate) {
                     (Some(de), Some(le)) => Some(de.min(le)),
@@ -482,6 +499,24 @@ impl AckedPacket {
         } else {
             lhs.seq_no.cmp(&rhs.seq_no)
         }
+    }
+}
+
+/// The padding rate for a loss controller `state`, as libWebRTC's `GetPacingRates`.
+///
+/// In [`LossControllerState::IncreaseUsingPadding`] the estimate may only grow by a factor
+/// of the acknowledged bitrate, so the pacer pads up to the estimate to let the acknowledged
+/// bitrate follow it. The padding stays within the desired bitrate: the application does not
+/// want to send more than that, and probes are limited by it as well.
+pub(crate) fn loss_recovery_padding_rate(
+    state: LossControllerState,
+    estimate: Bitrate,
+    desired: Bitrate,
+) -> Bitrate {
+    if state == LossControllerState::IncreaseUsingPadding {
+        estimate.min(desired)
+    } else {
+        Bitrate::ZERO
     }
 }
 
@@ -780,6 +815,46 @@ mod test {
             bwe.bandwidth_limited_cause(),
             BandwidthLimitedCause::LossLimitedBwe | BandwidthLimitedCause::LossLimitedBweIncreasing
         ));
+    }
+
+    #[test]
+    fn loss_recovery_padding_rate_follows_state() {
+        let estimate = Bitrate::kbps(500);
+        let desired = Bitrate::mbps(4);
+
+        // Up to the estimate while increasing using padding.
+        let rate = loss_recovery_padding_rate(
+            LossControllerState::IncreaseUsingPadding,
+            estimate,
+            desired,
+        );
+        assert_eq!(rate, estimate);
+
+        // Not above the desired bitrate, so not at all without one.
+        let rate = loss_recovery_padding_rate(
+            LossControllerState::IncreaseUsingPadding,
+            estimate,
+            Bitrate::kbps(300),
+        );
+        assert_eq!(rate, Bitrate::kbps(300));
+        let rate = loss_recovery_padding_rate(
+            LossControllerState::IncreaseUsingPadding,
+            estimate,
+            Bitrate::ZERO,
+        );
+        assert_eq!(rate, Bitrate::ZERO);
+
+        // Nothing in the other states.
+        for state in [
+            LossControllerState::Increasing,
+            LossControllerState::Decreasing,
+            LossControllerState::DelayBased,
+        ] {
+            assert_eq!(
+                loss_recovery_padding_rate(state, estimate, desired),
+                Bitrate::ZERO
+            );
+        }
     }
 
     #[test]

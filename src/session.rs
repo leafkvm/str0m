@@ -1449,13 +1449,18 @@ impl Session {
         };
         let is_overuse = bwe.is_overusing();
         let minimum = bwe.minimum_bitrate();
+        let loss_recovery = bwe.loss_recovery_padding_rate();
 
         let has_active_media = self.has_active_outgoing_media();
 
         // Calculate pacing and padding rates
-        let result =
-            self.pacer_control
-                .calculate(has_active_media, current_estimate, is_overuse, minimum);
+        let result = self.pacer_control.calculate(
+            has_active_media,
+            current_estimate,
+            is_overuse,
+            minimum,
+            loss_recovery,
+        );
 
         self.pacer.set_padding_rate(result.padding_rate);
         self.pacer.set_pacing_rate(result.pacing_rate);

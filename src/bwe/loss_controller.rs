@@ -82,6 +82,10 @@ pub struct LossController {
     /// HOLD mechanism state - prevents immediate ramp-up after loss
     last_hold_info: HoldInfo,
 
+    /// The estimate that started the current padding duration, and when (libWebRTC's
+    /// `last_padding_info_`).
+    last_padding_info: PaddingInfo,
+
     /// ALR start time (None if not in ALR)
     alr_start_time: Option<Instant>,
 
@@ -97,6 +101,9 @@ pub struct LossController {
 pub enum LossControllerState {
     /// LossController is in increasing state
     Increasing,
+    /// LossController is in increasing state and the pacer pads up to the estimate, so that
+    /// the acknowledged bitrate, which bounds the increase, can follow the estimate.
+    IncreaseUsingPadding,
     /// LossController is in decreasing state
     Decreasing,
     /// LossController is in relaying the estimate of the delay controller
@@ -142,6 +149,7 @@ impl LossController {
             delay_based_estimate: Bitrate::INFINITY,
 
             last_hold_info: HoldInfo::default(),
+            last_padding_info: PaddingInfo::default(),
 
             alr_start_time: None,
             link_capacity_estimate: None,
@@ -345,11 +353,27 @@ impl LossController {
         }
 
         // State transitions with HOLD mechanism (WebRTC lines 336-378)
+        let bounded_bandwidth_estimate = self.bound_estimate(loss_limited_bandwidth);
         let new_state = if self.is_estimate_increasing_when_loss_limited(best_candidate)
+            && self.can_keep_increasing_state(bounded_bandwidth_estimate)
             && loss_limited_bandwidth < delay_based_estimated
             && loss_limited_bandwidth < self.max_bitrate
         {
-            LossControllerState::Increasing
+            let padding_duration = self.config.padding_duration;
+            if !padding_duration.is_zero()
+                && bounded_bandwidth_estimate > self.last_padding_info.padding_rate
+            {
+                // Start a new padding duration.
+                self.last_padding_info = PaddingInfo {
+                    padding_rate: bounded_bandwidth_estimate,
+                    padding_timestamp: self.last_send_time_most_recent_observation,
+                };
+            }
+            if padding_duration.is_zero() {
+                LossControllerState::Increasing
+            } else {
+                LossControllerState::IncreaseUsingPadding
+            }
         } else if loss_limited_bandwidth < self.delay_based_estimate
             && loss_limited_bandwidth < self.max_bitrate
         {
@@ -368,6 +392,7 @@ impl LossController {
                     rate: loss_limited_bandwidth,
                 };
             }
+            self.last_padding_info = PaddingInfo::default();
             LossControllerState::Decreasing
         } else {
             // Reset HOLD info when returning to DelayBased
@@ -376,6 +401,7 @@ impl LossController {
                 duration: Duration::from_millis(300),
                 rate: Bitrate::INFINITY,
             };
+            self.last_padding_info = PaddingInfo::default();
             LossControllerState::DelayBased
         };
         self.set_state(new_state);
@@ -425,25 +451,26 @@ impl LossController {
         else {
             return result;
         };
+        result.bandwidth_estimate = Some(self.bound_estimate(loss_limited_bandwidth));
+
+        result
+    }
+
+    /// Bound a loss limited bandwidth by the delay-based estimate and the instant bounds.
+    fn bound_estimate(&self, loss_limited_bandwidth: Bitrate) -> Bitrate {
         let instant_upper_bound = self.get_instant_upper_bound();
         let instant_lower_bound = self.get_instant_lower_bound();
 
         if self.delay_based_estimate.is_valid() {
-            result.bandwidth_estimate = Some(
-                loss_limited_bandwidth
-                    .min(self.delay_based_estimate)
-                    .min(instant_upper_bound)
-                    .max(instant_lower_bound),
-            )
+            loss_limited_bandwidth
+                .min(self.delay_based_estimate)
+                .min(instant_upper_bound)
+                .max(instant_lower_bound)
         } else {
-            result.bandwidth_estimate = Some(
-                loss_limited_bandwidth
-                    .min(instant_upper_bound)
-                    .max(instant_lower_bound),
-            )
+            loss_limited_bandwidth
+                .min(instant_upper_bound)
+                .max(instant_lower_bound)
         }
-
-        result
     }
 
     fn maybe_add_observation(&mut self, packet_results: &[impl PacketResult]) -> bool {
@@ -697,7 +724,25 @@ impl LossController {
             return true;
         }
 
-        current == candidate && self.state == LossControllerState::Increasing
+        current == candidate
+            && matches!(
+                self.state,
+                LossControllerState::Increasing | LossControllerState::IncreaseUsingPadding
+            )
+    }
+
+    /// Whether `IncreaseUsingPadding` may continue: for `padding_duration` after the
+    /// estimate last reached a new high, or while it exceeds that high.
+    fn can_keep_increasing_state(&self, estimate: Bitrate) -> bool {
+        if self.config.padding_duration.is_zero()
+            || self.state != LossControllerState::IncreaseUsingPadding
+        {
+            return true;
+        }
+
+        self.last_padding_info.padding_timestamp + self.config.padding_duration
+            >= self.last_send_time_most_recent_observation
+            || self.last_padding_info.padding_rate < estimate
     }
 
     fn is_bandwidth_limited_due_to_loss(&self) -> bool {
@@ -920,6 +965,7 @@ struct Config {
     lower_bound_by_acked_rate_factor: f64,
     bandwidth_rampup_hold_threshold: f64,
     bandwidth_rampup_upper_bound_factor_in_hold: f64,
+    padding_duration: Duration,
 }
 
 #[derive(Debug)]
@@ -1052,6 +1098,22 @@ impl Default for HoldInfo {
     }
 }
 
+/// The estimate and time at the start of the current padding duration.
+#[derive(Debug, Clone, Copy)]
+struct PaddingInfo {
+    padding_rate: Bitrate,
+    padding_timestamp: Timestamp,
+}
+
+impl Default for PaddingInfo {
+    fn default() -> Self {
+        Self {
+            padding_rate: Bitrate::NEG_INFINITY,
+            padding_timestamp: Timestamp::DistantPast,
+        }
+    }
+}
+
 trait AsValid<T> {
     fn as_valid(&self) -> Option<T>;
 }
@@ -1110,6 +1172,7 @@ impl Default for Config {
             lower_bound_by_acked_rate_factor: 1.0,
             bandwidth_rampup_hold_threshold: 1.3,
             bandwidth_rampup_upper_bound_factor_in_hold: 1.2,
+            padding_duration: Duration::from_secs(2),
         }
     }
 }
@@ -1136,6 +1199,8 @@ mod test {
     use systemstat::Duration;
 
     use super::{Bitrate, DataSize, LossBasedBweResult, LossController, LossControllerState};
+    use crate::bwe_::loss_recovery_padding_rate;
+    use crate::pacer::PacerControl;
     struct PacketResult {
         local_send_time: Instant,
         size: DataSize,
@@ -1222,8 +1287,9 @@ mod test {
         } = lbc.loss_based_result();
 
         assert!(
-            state == LossControllerState::DelayBased || state == LossControllerState::Increasing,
-            "With stable inherent loss, should be in DelayBased or Increasing state, got {:?}",
+            state == LossControllerState::DelayBased
+                || state == LossControllerState::IncreaseUsingPadding,
+            "With stable inherent loss, should be in DelayBased or IncreaseUsingPadding state, got {:?}",
             state
         );
 
@@ -1333,11 +1399,13 @@ mod test {
         let LossBasedBweResult { state, .. } = lbc.loss_based_result();
 
         // Note: The loss controller returns loss_limited_bandwidth even in DelayBased state.
-        // After recovery, it may be in Increasing or DelayBased state depending on dynamics.
-        // The BWE integration layer uses the delay-based estimate when state is DelayBased.
+        // After recovery, it may be in IncreaseUsingPadding or DelayBased state depending on
+        // dynamics. The BWE integration layer uses the delay-based estimate when state is
+        // DelayBased.
         assert!(
-            state == LossControllerState::DelayBased || state == LossControllerState::Increasing,
-            "After recovery from loss spike, should be in DelayBased or Increasing state, got {:?}",
+            state == LossControllerState::DelayBased
+                || state == LossControllerState::IncreaseUsingPadding,
+            "After recovery from loss spike, should be in DelayBased or IncreaseUsingPadding state, got {:?}",
             state
         );
     }
@@ -1485,7 +1553,7 @@ mod test {
                     average loss caused by spike ages out"
             );
             // Up from the HOLD rate, still loss limited.
-            assert_eq!(state, LossControllerState::Increasing);
+            assert_eq!(state, LossControllerState::IncreaseUsingPadding);
         }
     }
 
@@ -1590,6 +1658,253 @@ mod test {
             );
         });
         assert!(loss_limited, "the loss should limit the estimate");
+    }
+
+    /// A closed loop of an application limited sender, its pacer and a link: media at
+    /// `MEDIA_SHARE` of the estimate, padded up to the pacer's padding rate, on a link of
+    /// `capacity_kbps(t)` that drops what is sent above it. The acked rate is what got
+    /// through in the last 150 ms. Calls `check(t, acked, result)` after every 50 ms batch.
+    fn simulate_paced(
+        lbc: &mut LossController,
+        secs: f64,
+        delay_kbps: u64,
+        capacity_kbps: impl Fn(f64) -> f64,
+        mut check: impl FnMut(f64, Bitrate, &LossBasedBweResult),
+    ) {
+        const MEDIA_SHARE: f64 = 0.8;
+        let pacer = PacerControl::new();
+        let start = Instant::now();
+        let batch = Duration::from_millis(50);
+        let size = DataSize::bytes(1200);
+        let delay_based = Bitrate::kbps(delay_kbps);
+        let mut t = Duration::ZERO;
+        let (mut packets_due, mut losses_due) = (0.0, 0.0);
+        let mut delivered_kbps = [0.0; 3];
+        while t.as_secs_f64() < secs {
+            let result = lbc.loss_based_result();
+            let estimate = result.bandwidth_estimate.expect("an estimate");
+            let padding = loss_recovery_padding_rate(result.state, estimate, Bitrate::INFINITY);
+            let padding_rate = pacer
+                .calculate(true, estimate, false, Bitrate::ZERO, padding)
+                .padding_rate;
+            let send_kbps = (estimate.as_f64() * MEDIA_SHARE).max(padding_rate.as_f64()) / 1000.0;
+            let capacity = capacity_kbps(t.as_secs_f64());
+            let loss = ((send_kbps - capacity) / send_kbps).max(0.0);
+
+            packets_due += send_kbps * 1000.0 * batch.as_secs_f64() / (size.as_bytes_f64() * 8.0);
+            let n = packets_due as u32;
+            packets_due -= n as f64;
+            let packets: Vec<_> = (0..n)
+                .map(|i| {
+                    losses_due += loss;
+                    let lost = losses_due >= 1.0;
+                    if lost {
+                        losses_due -= 1.0;
+                    }
+                    PacketResult {
+                        local_send_time: start + t + batch * i / n,
+                        size,
+                        lost,
+                    }
+                })
+                .collect();
+            delivered_kbps.rotate_left(1);
+            delivered_kbps[2] = send_kbps * (1.0 - loss);
+            let acked = Bitrate::kbps((delivered_kbps.iter().sum::<f64>() / 3.0) as u64);
+
+            lbc.set_alr_start_time(None);
+            lbc.set_acknowledged_bitrate(acked);
+            lbc.update_bandwidth_estimate(&packets, delay_based);
+            if let Some(estimate) = lbc.loss_based_result().bandwidth_estimate {
+                if estimate > delay_based {
+                    lbc.set_bandwidth_estimate(delay_based);
+                }
+            }
+            t += batch;
+            check(t.as_secs_f64(), acked, &lbc.loss_based_result());
+        }
+    }
+
+    /// The run of `padding_lifts_app_limited_estimate_after_loss`.
+    #[derive(Debug)]
+    struct Recovery {
+        /// The lowest estimate after the loss started.
+        lowest: Bitrate,
+        /// When the estimate first increased while loss limited.
+        increasing_at: Option<f64>,
+        /// When the estimate reached 6 Mbps after the loss.
+        recovered_at: Option<f64>,
+        /// Whether the pacer padded above its normal target.
+        padded: bool,
+        /// Estimate, acked rate and state at the end.
+        end: (Bitrate, Bitrate, LossControllerState),
+    }
+
+    fn recover_after_loss(padding_duration: Duration) -> Recovery {
+        // An application limited sender at 0.8 x the estimate on a 8 Mbps link that
+        // drops to 400 kbps for 1 s.
+        let mut lbc = LossController::new();
+        lbc.config.padding_duration = padding_duration;
+        lbc.set_bandwidth_estimate(Bitrate::mbps(4));
+        let capacity = |t: f64| {
+            if (5.0..6.0).contains(&t) {
+                400.0
+            } else {
+                8_000.0
+            }
+        };
+        let mut run = Recovery {
+            lowest: Bitrate::INFINITY,
+            increasing_at: None,
+            recovered_at: None,
+            padded: false,
+            end: (
+                Bitrate::ZERO,
+                Bitrate::ZERO,
+                LossControllerState::DelayBased,
+            ),
+        };
+        simulate_paced(&mut lbc, 16.0, 8_000, capacity, |t, acked, result| {
+            let estimate = result.bandwidth_estimate.unwrap();
+            run.padded |= result.state == LossControllerState::IncreaseUsingPadding;
+            if t > 5.0 {
+                run.lowest = run.lowest.min(estimate);
+                if run.increasing_at.is_none()
+                    && matches!(
+                        result.state,
+                        LossControllerState::Increasing | LossControllerState::IncreaseUsingPadding
+                    )
+                {
+                    run.increasing_at = Some(t);
+                }
+            }
+            if t > 6.0 && run.recovered_at.is_none() && estimate >= Bitrate::kbps(6_000) {
+                run.recovered_at = Some(t);
+            }
+            run.end = (estimate, acked, result.state);
+        });
+        run
+    }
+
+    #[test]
+    fn padding_lifts_app_limited_estimate_after_loss() {
+        // After the loss the media alone cannot raise the acked rate, which bounds the
+        // increase while loss limited; padding up to the estimate can.
+        let padded = recover_after_loss(Duration::from_secs(2));
+        let unpadded = recover_after_loss(Duration::ZERO);
+        println!("padded {padded:?}\nunpadded {unpadded:?}");
+
+        assert!(
+            unpadded.lowest < Bitrate::kbps(1_000),
+            "the loss should cut the estimate"
+        );
+        assert!(!unpadded.padded);
+        let (estimate, acked, state) = unpadded.end;
+        assert!(
+            unpadded.recovered_at.is_none()
+                && state != LossControllerState::DelayBased
+                && estimate <= acked * 1.5,
+            "without padding the estimate stays near the acked rate"
+        );
+
+        assert!(
+            padded.lowest < Bitrate::kbps(1_000),
+            "the loss should cut the estimate"
+        );
+        assert!(padded.padded);
+        let increasing_at = padded.increasing_at.expect("a loss limited increase");
+        let recovered_at = padded
+            .recovered_at
+            .expect("the estimate should recover to 6 Mbps");
+        assert!(
+            recovered_at - increasing_at < 4.0,
+            "6 Mbps reached {:.2} s after the increase started",
+            recovered_at - increasing_at
+        );
+        assert_eq!(padded.end.2, LossControllerState::DelayBased);
+    }
+
+    /// libWebRTC's DecreaseAfterPadding: 50 % loss until the state is `Decreasing`,
+    /// then no loss at an acked rate that does not follow the estimate. Returns the
+    /// state and estimate after every observation, with the time since the loss.
+    fn loss_then_unacked_padding(
+        lbc: &mut LossController,
+    ) -> Vec<(Duration, LossControllerState, Bitrate)> {
+        let step = Duration::from_millis(300);
+        let mut elapsed = Duration::ZERO;
+        lbc.set_bandwidth_estimate(Bitrate::kbps(2_500));
+        lbc.set_acknowledged_bitrate(Bitrate::kbps(1_250));
+        let mut pkt_builder = PacketBuilder::new(Instant::now())
+            .num_packets(25)
+            .with_loss(0.5);
+        while lbc.loss_based_result().state != LossControllerState::Decreasing {
+            let result = pkt_builder.build_packets();
+            lbc.update_bandwidth_estimate(&result, Bitrate::INFINITY);
+            pkt_builder.now += step;
+            elapsed += step;
+            assert!(elapsed < Duration::from_secs(10), "no decrease");
+        }
+        lbc.set_acknowledged_bitrate(Bitrate::kbps(600));
+        pkt_builder = pkt_builder.with_loss(0.0);
+        elapsed = Duration::ZERO;
+        let mut run = vec![];
+        for _ in 0..40 {
+            let result = pkt_builder.build_packets();
+            lbc.update_bandwidth_estimate(&result, Bitrate::INFINITY);
+            pkt_builder.now += step;
+            elapsed += step;
+            let result = lbc.loss_based_result();
+            run.push((elapsed, result.state, result.bandwidth_estimate.unwrap()));
+        }
+        run
+    }
+
+    #[test]
+    fn increase_using_padding_ends_after_padding_duration() {
+        // The padding is not acked, so the estimate stops at the bound by the acked rate
+        // and the state ends a padding duration after the last new high.
+        let mut lbc = LossController::new();
+        let run = loss_then_unacked_padding(&mut lbc);
+        let padding = |(_, s, _): &&(Duration, LossControllerState, Bitrate)| {
+            *s == LossControllerState::IncreaseUsingPadding
+        };
+        let first = run.iter().position(|r| padding(&r)).expect("padding");
+        let end = first
+            + run[first..]
+                .iter()
+                .position(|r| !padding(&r))
+                .expect("an end");
+        let (left, state, estimate) = run[end];
+        let (_, _, highest) = run[end - 1];
+        let reached = run[first..end].iter().find(|r| r.2 == highest).unwrap().0;
+        println!(
+            "padding from {:?}, highest {highest} at {reached:?}, {state:?} at {left:?}",
+            run[first].0
+        );
+        assert_eq!(state, LossControllerState::Decreasing);
+        assert_eq!(estimate, highest, "HOLD at the padded estimate");
+        // The 600 kbps acked rate x 1.2 in the HOLD region.
+        assert_eq!(highest, Bitrate::kbps(720));
+        let held = left - reached;
+        // Observations are 300 ms apart.
+        assert!(
+            held > Duration::from_secs(2) && held <= Duration::from_millis(2_300),
+            "left {held:?} after the highest estimate"
+        );
+    }
+
+    #[test]
+    fn increasing_without_padding_duration() {
+        // A zero padding duration (libWebRTC's `PaddingDuration:0`) increases without
+        // padding.
+        let mut lbc = LossController::new();
+        lbc.config.padding_duration = Duration::ZERO;
+        let run = loss_then_unacked_padding(&mut lbc);
+        assert!(run.iter().any(|r| r.1 == LossControllerState::Increasing));
+        assert!(
+            !run.iter()
+                .any(|r| r.1 == LossControllerState::IncreaseUsingPadding)
+        );
     }
 
     struct PacketBuilder {

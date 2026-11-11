@@ -1,5 +1,6 @@
 # Unreleased
 
+  * Keep 10 000 TWCC send records, so feedback for a deep queue still finds its packets
   * Put the local ICE candidates on the first BUNDLE m-line that is not rejected
   * Request a keyframe when a NACK names a packet that is no longer cached
   * Forward a changed bandwidth-limited cause to the probe controller with an unchanged estimate

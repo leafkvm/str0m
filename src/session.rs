@@ -201,7 +201,11 @@ impl Session {
             last_twcc: already_happened(),
             twcc: 0,
             twcc_rx_register: TwccRecvRegister::new(100),
-            twcc_tx_register: TwccSendRegister::new(1000),
+            // Enough send records for the TWCC reports of a high-rate sender into a slow
+            // link with a deep queue: 10 000 records are about 3 s at 40 Mbit/s. With fewer,
+            // every report can name packets already evicted, leaving the estimator without
+            // an acked rate or an estimate update.
+            twcc_tx_register: TwccSendRegister::new(10_000),
             max_rx_seq_lookup: HashMap::new(),
             bwe,
             bwe_last_event: None,

@@ -620,6 +620,12 @@ impl ProbeControl {
         not_happening()
     }
 
+    /// The bandwidth-limited cause last given with an estimate.
+    #[cfg(test)]
+    pub(crate) fn last_cause(&self) -> BandwidthLimitedCause {
+        self.last_cause
+    }
+
     fn can_probe(&self, estimate: Bitrate) -> bool {
         // Infinite estimate indicates no valid measurement yet.
         if estimate == Bitrate::INFINITY {

@@ -144,7 +144,7 @@ struct SendSideBandwidthEstimator {
     started_at: Option<Instant>,
     alr_detector: AlrDetector,
     link_capacity_estimator: LinkCapacityEstimator,
-    last_updated_estimate: Option<Bitrate>,
+    last_updated_estimate: Option<(Bitrate, BandwidthLimitedCause)>,
 }
 
 impl SendSideBandwidthEstimator {
@@ -352,18 +352,20 @@ impl SendSideBandwidthEstimator {
         let Some(estimate) = self.last_estimate() else {
             return;
         };
-        // Did it change?
-        if self.last_updated_estimate == Some(estimate) {
+        // Did it, or the cause limiting it, change? The cause changes without the estimate
+        // when an overuse ends while the estimate holds still (in AIMD hold, or capped by the
+        // acked rate of an application limited sender): the probe controller must not keep
+        // the overuse cause, which blocks every probe.
+        let cause = self.bandwidth_limited_cause();
+        if self.last_updated_estimate == Some((estimate, cause)) {
             return;
         }
-
-        let cause = self.bandwidth_limited_cause();
 
         self.probe_control.set_estimated_bitrate(estimate, cause);
         self.alr_detector.set_estimated_bitrate(estimate);
 
         // Don't update until this changes.
-        self.last_updated_estimate = Some(estimate);
+        self.last_updated_estimate = Some((estimate, cause));
     }
 
     fn bandwidth_limited_cause(&self) -> BandwidthLimitedCause {
@@ -552,6 +554,115 @@ mod test {
                     .is_none()
             );
         }
+    }
+
+    /// A sender of 1200 byte packets over a link with a queue and 20 ms of propagation
+    /// delay, feeding the estimator as `Session` does: TWCC reports every 50 ms, each
+    /// followed by a timeout.
+    struct Link {
+        start: Instant,
+        /// Time since `start`.
+        t: Duration,
+        /// When the link's queue empties.
+        queue_free: Instant,
+        seq: u64,
+        /// Sent packets not yet reported: sequence number, send and receive time.
+        in_flight: Vec<(u64, Instant, Instant)>,
+        next_report: Instant,
+    }
+
+    impl Link {
+        fn new() -> Self {
+            let start = Instant::now();
+            Link {
+                start,
+                t: Duration::ZERO,
+                queue_free: start,
+                seq: 0,
+                in_flight: vec![],
+                next_report: start,
+            }
+        }
+
+        /// Send at `send` for `secs` over a link of `link`.
+        fn run(
+            &mut self,
+            bwe: &mut SendSideBandwidthEstimator,
+            secs: f64,
+            send: Bitrate,
+            link: Bitrate,
+        ) {
+            let size = DataSize::bytes(1200);
+            let end = self.t + Duration::from_secs_f64(secs);
+            while self.t < end {
+                let sent = self.start + self.t;
+                let received = self.queue_free.max(sent) + size / link;
+                self.queue_free = received;
+                self.seq += 1;
+                let remote_recv = received + Duration::from_millis(20);
+                self.in_flight.push((self.seq, sent, remote_recv));
+                self.t += size / send;
+                let now = self.start + self.t;
+                if now < self.next_report {
+                    continue;
+                }
+                let arrived = self.in_flight.iter().take_while(|r| r.2 <= now).count();
+                let report: Vec<_> = self
+                    .in_flight
+                    .drain(..arrived)
+                    .map(|(seq, sent, recv)| {
+                        TwccSendRecord::test_new(
+                            TwccPacketId::new(seq),
+                            sent,
+                            1200,
+                            now,
+                            Some(recv),
+                        )
+                    })
+                    .collect();
+                bwe.update(report.iter(), now);
+                let _ = bwe.handle_timeout(Bitrate::mbps(10), true, now);
+                self.next_report = now + Duration::from_millis(50);
+            }
+        }
+    }
+
+    #[test]
+    fn cause_reaches_probe_control_without_estimate_change() {
+        // 3 Mbit/s on an 8 Mbit/s link, then the link drops to 2 Mbit/s. The overuse is
+        // detected before the estimate is cut: the probe controller must know at once.
+        let mut bwe = SendSideBandwidthEstimator::new(Bitrate::mbps(4));
+        let mut link = Link::new();
+        link.run(&mut bwe, 3.0, Bitrate::mbps(3), Bitrate::mbps(8));
+        let before = bwe.last_estimate();
+        let mut overused = false;
+        for _ in 0..40 {
+            link.run(&mut bwe, 0.05, Bitrate::mbps(3), Bitrate::mbps(2));
+            if bwe.is_overusing() {
+                overused = true;
+                break;
+            }
+        }
+        assert!(overused, "the 2 Mbit/s link should be detected as overuse");
+        assert_eq!(bwe.last_estimate(), before, "precondition: not cut yet");
+        assert_eq!(
+            bwe.probe_control.last_cause(),
+            BandwidthLimitedCause::DelayBasedLimitedDelayIncreased
+        );
+
+        // The sender backs off and the queue drains: once the overuse is over the cause is
+        // the delay-based limit again.
+        for _ in 0..40 {
+            link.run(&mut bwe, 0.05, Bitrate::kbps(500), Bitrate::mbps(2));
+            if !bwe.is_overusing() {
+                break;
+            }
+        }
+        assert!(!bwe.is_overusing(), "the overuse should end");
+        assert_eq!(
+            bwe.probe_control.last_cause(),
+            BandwidthLimitedCause::DelayBasedLimited
+        );
     }
 
     #[test]

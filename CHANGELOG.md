@@ -1,5 +1,6 @@
 # Unreleased
 
+  * Forward a changed bandwidth-limited cause to the probe controller with an unchanged estimate
   * Release a requested probe burst at once, not `min_probe_delta` after the request
   * Space large-drop probes from the last drop probe, as libwebrtc does
   * Fix the unit of the average packet size in the delay-based additive increase

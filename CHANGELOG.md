@@ -1,5 +1,6 @@
 # Unreleased
 
+  * Fix the unit of the average packet size in the delay-based additive increase
   * Bound the loss-based estimate below by the acked bitrate, as libwebrtc does
   * Bound the acked bitrate's sample uncertainty for increases, so it recovers after a media gap
   * Allow disabling BWE estimate smoothing #1119

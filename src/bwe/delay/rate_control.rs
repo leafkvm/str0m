@@ -292,7 +292,8 @@ impl RateControl {
     fn estimated_packet_size(&self) -> f64 {
         // Assume 30 FPS video dominates the send rate
         let bits_per_frame = self.estimated_bitrate.as_f64() / 30.0;
-        let packets_per_frame = (bits_per_frame / (1200.0 / 8.0)).ceil();
+        // 1200 byte packets, in bits as the frame size.
+        let packets_per_frame = (bits_per_frame / (1200.0 * 8.0)).ceil();
 
         bits_per_frame / packets_per_frame
     }
@@ -514,7 +515,47 @@ mod test {
 
             // NB: Additive increase because we are nearing convergence
             rate_controller.update(Signal::Normal, 70_000.into(), None, now + duration_ms(3500));
-            assert_eq!(rate_controller.estimated_bitrate().as_u64(), 72552);
+            // 71 552 bit/s: one 2385 bit packet per frame, 0.5 x that (response time 180 ms).
+            assert_eq!(rate_controller.estimated_bitrate().as_u64(), 72744);
+        }
+
+        #[test]
+        fn test_additive_increase_is_half_an_average_packet_per_response_time() {
+            // Near convergence, with updates at least the response time (RTT + 100 ms) apart,
+            // each update adds 0.5 x the average packet size in bits (libWebRTC: 1200 byte
+            // packets of a 30 fps stream). At 8 Mbit/s: 266 667 bits per frame, 28 packets,
+            // 9524 bits each, so +4762 bit/s per update.
+            let mut rate_controller = make_control(10_000_000);
+            let now = Instant::now();
+            let rtt = Some(duration_ms(60));
+            let observed = 9_411_765;
+
+            // Overuse: 0.85 x 9 411 765 = 8 Mbit/s, which also starts the observed average.
+            rate_controller.update(Signal::Overuse, observed.into(), rtt, now);
+            let start = rate_controller.estimated_bitrate().as_u64();
+            assert!(start.abs_diff(8_000_000) <= 1);
+
+            // The decrease leaves the state at hold, so each normal signal increases; 200 ms
+            // apart (response time 160 ms).
+            let mut last = start;
+            for i in 1..4 {
+                rate_controller.update(
+                    Signal::Normal,
+                    observed.into(),
+                    rtt,
+                    now + duration_ms(200 * i),
+                );
+                let estimate = rate_controller.estimated_bitrate().as_u64();
+                let step = estimate - last;
+                let frame = last as f64 / 30.0;
+                let half_packet = 0.5 * frame / (frame / 9600.0).ceil();
+                assert!((4_760..4_770).contains(&step), "step {step} at update {i}");
+                assert!(
+                    (step as f64 - half_packet).abs() <= 1.0,
+                    "step {step} at update {i}"
+                );
+                last = estimate;
+            }
         }
     }
 

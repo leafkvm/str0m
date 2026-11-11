@@ -268,18 +268,14 @@ impl SendSideBandwidthEstimator {
         }
 
         // This corresponds to UpdateLossBasedEstimator + UpdateEstimate
+        //
+        // The delay-based estimate caps the loss controller's result, not its loss model:
+        // set as the model's bandwidth, an overuse dip below the sending rate makes the
+        // model explain the window's random loss by that rate, its inherent loss falls to
+        // the lower bound, and the average loss then blocks the return to the delay-based
+        // estimate once the dip is over, leaving the estimate loss limited at the dip.
         self.loss_controller
             .update_bandwidth_estimate(&send_records, delay_estimate);
-
-        // Loss-based result is capped by delay_based_limit
-        let loss_result = self.loss_controller.loss_based_result();
-        if let Some(loss_estimate) = loss_result.bandwidth_estimate {
-            if loss_estimate > delay_estimate {
-                // Loss controller produced higher estimate than delay controller
-                // Cap it at delay estimate (delay controller is the upper limit)
-                self.loss_controller.set_bandwidth_estimate(delay_estimate);
-            }
-        }
 
         // Feed the (possibly combined) estimate into subcomponents wanting it.
         self.propagate_estimate();
@@ -885,6 +881,35 @@ mod test {
         println!("highest estimate in the 10 s after the probe {highest}");
         assert!(loss_limited, "precondition: loss limited at times");
         assert!(highest > probe_rate, "held at the probe result: {highest}");
+    }
+
+    #[test]
+    fn short_overuse_dip_does_not_leave_estimate_loss_limited() {
+        // 8 Mbps with 1 % random loss on a 20 Mbps link; at 10 s the link drops to 5 Mbps
+        // for 300 ms, an overuse cuts the delay-based estimate below the acked rate, and the
+        // delay-based estimate then recovers. The loss is the same random loss as before the
+        // dip, so the loss-based estimate must not limit the estimate once the overuse is over.
+        let mut bwe = SendSideBandwidthEstimator::new(Bitrate::mbps(10));
+        let mut link = Link::new();
+        link.lose_every = 100;
+        let send = Bitrate::mbps(8);
+        link.run(&mut bwe, 10.0, send, Bitrate::mbps(20));
+        let (mut overused, mut over) = (false, false);
+        let mut loss_limited = None;
+        for tick in 1..=400 {
+            let capacity = if tick <= 6 { 5 } else { 20 };
+            link.run(&mut bwe, 0.05, send, Bitrate::mbps(capacity));
+            overused |= bwe.is_overusing();
+            over |= overused && !bwe.is_overusing();
+            if over && loss_limited.is_none() && bwe.is_loss_limited() {
+                loss_limited = Some((10.0 + tick as f64 * 0.05, bwe.last_estimate()));
+            }
+        }
+        let (estimate, delay) = (bwe.last_estimate(), bwe.delay_controller.last_estimate());
+        println!("loss limited at {loss_limited:?}, at 30 s {estimate:?} delay-based {delay:?}");
+        assert!(overused, "the dip should be an overuse");
+        assert_eq!(loss_limited, None, "loss limited after the overuse");
+        assert_eq!(estimate, delay);
     }
 
     #[test]

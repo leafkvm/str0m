@@ -306,7 +306,12 @@ handle. The controller only ever reduces estimates, acting as a safety cap
 on the delay-based estimate rather than competing with it. This design
 prevents the loss controller from causing premature rate reductions based
 on transient loss while still catching cases where delay signals miss
-congestion.
+congestion. The delay-based estimate caps the loss controller's result and
+the increase of its candidates, but it is not written into the loss
+model: set as the model's bandwidth, a short overuse dip below the sending
+rate would make the model explain the window's random loss by that rate,
+and the estimate would stay loss limited at the dip after the delay-based
+estimate has recovered.
 
 The controller integrates with ALR detection. When transitioning into or
 out of ALR, the controller resets its observation window to avoid mixing
@@ -873,6 +878,25 @@ transmission smoothing and padding generation respectively.
       congestion loss below the window's average (a mild further shrink
       while a heavier burst is in the window) holds the estimate until the
       burst's weight has decayed, unless the delay-based estimate drops
+
+11. **Delay-Based Estimate Not Written into the Loss Model:**
+    - **WebRTC**: With `BoundBestCandidate` (on by default) the best
+      candidate takes the bounded estimate, which includes the delay-based
+      estimate, as its bandwidth (behaviour read from the source)
+    - **str0m**: The delay-based estimate caps the loss controller's result
+      and the increase of its candidates, but is not written into its loss
+      model
+    - **Reason**: The write takes effect on an overuse dip below the
+      acknowledged bitrate and sets the model's bandwidth below the sending
+      rates of the window. The model then explains the window's random loss
+      by that rate, the candidates' inherent loss falls to its lower bound,
+      and once the dip is over the window's average loss blocks the return
+      to the delay-based estimate: a 60-200 ms dip becomes a lasting
+      loss-limited cut
+    - **Impact**: A short overuse dip under random loss does not leave the
+      estimate loss limited. After a congestion loss phase the inherent-loss
+      estimate takes a different path, so the return to the delay-based
+      estimate can come later (or sooner)
 
 ### Shared with WebRTC
 

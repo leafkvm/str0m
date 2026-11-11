@@ -1,5 +1,6 @@
 # Unreleased
 
+  * Stop writing the delay-based estimate into the loss controller's loss model
   * Remove the ALR link-capacity cap on loss-based candidates, which libwebrtc does not have
   * Lower the loss-based estimate only on an observation that raises the window's loss
   * Pad up to a recovering loss-based estimate, as libwebrtc's `kIncreaseUsingPadding`

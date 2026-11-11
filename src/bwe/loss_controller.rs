@@ -1628,13 +1628,6 @@ mod test {
                 let observations = lbc.num_observations;
                 lbc.update_bandwidth_estimate(&packets, delay_based);
                 let completed = Completed::of(lbc, observations);
-                // As SendSideBandwidthEstimator::update: the delay-based
-                // estimate caps the loss-based one.
-                if let Some(estimate) = lbc.loss_based_result().bandwidth_estimate {
-                    if estimate > delay_based {
-                        lbc.set_bandwidth_estimate(delay_based);
-                    }
-                }
                 t += batch;
                 check(t.as_secs_f64(), acked, &lbc.loss_based_result(), completed);
             }
@@ -1761,11 +1754,6 @@ mod test {
             let observations = lbc.num_observations;
             lbc.update_bandwidth_estimate(&packets, delay_based);
             let completed = Completed::of(lbc, observations);
-            if let Some(estimate) = lbc.loss_based_result().bandwidth_estimate {
-                if estimate > delay_based {
-                    lbc.set_bandwidth_estimate(delay_based);
-                }
-            }
             t += batch;
             let result = lbc.loss_based_result();
             check(&Tick {
@@ -2171,8 +2159,9 @@ mod test {
     fn loss_free_observations_do_not_lower_loss_limited_estimate() {
         // After the loss the sender is below the link and nothing is lost. The acked
         // rate follows the sender, which follows the estimate: if loss-free observations
-        // lowered the estimate to the acked rate, it would ratchet down.
-        let run = app_limited_after_loss(14.0, |_| 8_000.0, rig_delay);
+        // lowered the estimate to the acked rate, it would ratchet down. The delay-based
+        // estimate does not react, so that the loss alone limits the estimate.
+        let run = app_limited_after_loss(14.0, |_| 8_000.0, |_| 17_500);
         let (end_of_loss, next_loss) = loss_free_span(&run);
         let at_end = run[end_of_loss - 1].estimate;
         let lowest = run[end_of_loss..next_loss]
@@ -2441,6 +2430,69 @@ mod test {
                 tick.state
             );
         });
+    }
+
+    #[test]
+    fn short_delay_based_dip_is_not_kept_by_loss_estimate() {
+        // 1 % random loss on a 20 Mbps link the sender (at 0.8 x the estimate) never
+        // fills, and a 200 ms overuse dip of the delay-based estimate to 0.85 x the acked
+        // rate. Nothing in the loss says the capacity fell, so once the delay-based estimate
+        // is back the estimate follows it at the next observation.
+        let delay = 15_000;
+        let (dip_from, dip_to) = (5.0, 5.2);
+        let dip = 10_200; // 0.85 x the 12 Mbps acked
+        let delay_kbps = move |t: f64| {
+            if (dip_from..dip_to).contains(&t) {
+                dip
+            } else {
+                delay
+            }
+        };
+        let mut lbc = LossController::new();
+        lbc.set_bandwidth_estimate(Bitrate::kbps(delay));
+        let link = Link {
+            capacity_kbps: Box::new(|_| 20_000.0),
+            delay_kbps: Box::new(delay_kbps),
+            send_kbps: Box::new(|_| None),
+            random_loss: 0.01,
+            alr: Box::new(|_| true),
+        };
+        let mut run = vec![];
+        simulate_paced(&mut lbc, 10.0, &link, |tick| {
+            if tick.completed.is_some() || (4.9..6.0).contains(&tick.t) {
+                println!(
+                    "{:5.2} {:>14} acked {:>14} {:?}",
+                    tick.t,
+                    tick.estimate.to_string(),
+                    tick.acked.to_string(),
+                    tick.state,
+                );
+            }
+            run.push(*tick);
+        });
+        for s in &run {
+            assert!(
+                s.estimate <= Bitrate::kbps(delay_kbps(s.t - 0.05)),
+                "at {:.2} s the estimate {} is above the delay-based estimate",
+                s.t,
+                s.estimate
+            );
+        }
+        // The first observation completed after the delay-based estimate is back.
+        let back = run
+            .iter()
+            .find(|s| s.t > dip_to + 0.05 && s.completed.is_some())
+            .expect("an observation after the dip")
+            .t;
+        for s in run.iter().filter(|s| s.t >= back) {
+            assert_eq!(
+                s.estimate,
+                Bitrate::kbps(delay),
+                "at {:.2} s ({:?}), delay-based again from {dip_to:.2} s",
+                s.t,
+                s.state
+            );
+        }
     }
 
     struct PacketBuilder {

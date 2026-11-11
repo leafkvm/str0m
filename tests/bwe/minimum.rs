@@ -59,9 +59,9 @@ fn minimum_improves_recovery_with_a_fixed_layer() -> Result<(), RtcError> {
         sustained < Duration::from_secs(8),
         "recovery: {sustained:?}"
     );
-    // The 1 Mbps phase overflows the 50 kB buffer, and the automatic sender's recovery
-    // depends on when its loss-based estimate recovers or a probe comes; when that is early
-    // both senders recover with it. The minimum must not slow the recovery.
+    // The 1 Mbps phase loses packets, so the estimate is loss limited when the link recovers,
+    // and the loss controller pads up to its recovering estimate on its own. The minimum
+    // then adds no traffic the automatic recovery lacks; it must not slow the recovery.
     assert!(
         sustained <= automatic,
         "sustained traffic took {sustained:?}, automatic padding took {automatic:?}"

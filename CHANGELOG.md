@@ -1,5 +1,6 @@
 # Unreleased
 
+  * Lower the loss-based estimate only on an observation that raises the window's loss
   * Pad up to a recovering loss-based estimate, as libwebrtc's `kIncreaseUsingPadding`
   * Compare the BWE burst rule with unrounded send spacing, so a standing queue is not grouped as one burst (regression from #1074)
   * Treat the estimate as loss limited only while the loss-based estimate is below the delay-based one

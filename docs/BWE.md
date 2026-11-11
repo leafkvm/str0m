@@ -295,7 +295,10 @@ The controller estimates the inherent loss rate of the link over an
 observation window, establishing a baseline for expected packet loss. When
 observed loss exceeds this inherent rate, it signals congestion and
 reduces the bandwidth estimate accordingly. As in libwebrtc, the estimate
-is never below the acknowledged bitrate. The controller includes a Hold
+is never below the acknowledged bitrate. Unlike libwebrtc, only an
+observation whose loss ratio is above the window's average lowers the
+estimate below the one in use, and then at most to the acknowledged
+bitrate at that observation (see Deviations). The controller includes a Hold
 mechanism to prevent rapid ramp-up immediately after loss events—loss often
 indicates we've already exceeded capacity, so we need time to verify the
 network has recovered before growing again.
@@ -885,6 +888,26 @@ transmission smoothing and padding generation respectively.
      sent in the same millisecond still share a group. A release burst after
      an outage, which arrives like a draining queue, is grouped by the 5 ms
      send-time rule where its packets straddle a millisecond boundary
+
+10. **Loss-Based Estimate Held Between Lossy Observations:**
+    - **WebRTC**: The acknowledged bitrate bounds the loss-based estimate
+      from below at every update; above that, the instant upper bound from
+      the window's average loss applies
+    - **str0m**: The estimate in use before an observation is a floor for
+      the result, unless the observation's loss ratio is above the window's
+      average loss ratio; then the floor is the acknowledged bitrate at that
+      observation, if lower. The delay-based estimate still caps the result
+    - **Reason**: After a congestion loss burst the window's average loss
+      stays high while the burst's observations are in it (at least 15 ×
+      250 ms), but the acknowledged bitrate of an application-limited sender
+      measures the sender, not the path: lowering the estimate to it at
+      every update ratchets the estimate down with the sender. An
+      observation that does not raise the window's loss is no evidence of a
+      lower capacity
+    - **Impact**: A held estimate after a burst instead of a collapse. A new
+      congestion loss below the window's average (a mild further shrink
+      while a heavier burst is in the window) holds the estimate until the
+      burst's weight has decayed, unless the delay-based estimate drops
 
 ### Shared with WebRTC
 

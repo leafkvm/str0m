@@ -86,6 +86,11 @@ pub struct LossController {
     /// `last_padding_info_`).
     last_padding_info: PaddingInfo,
 
+    /// The estimate in use before the newest observation, or the acked rate at that
+    /// observation if lower and its loss ratio was above the window's average loss ratio:
+    /// `bound_estimate` stays at or above it, unless the delay-based estimate is lower.
+    estimate_floor: Bitrate,
+
     /// ALR start time (None if not in ALR)
     alr_start_time: Option<Instant>,
 
@@ -150,6 +155,7 @@ impl LossController {
 
             last_hold_info: HoldInfo::default(),
             last_padding_info: PaddingInfo::default(),
+            estimate_floor: Bitrate::ZERO,
 
             alr_start_time: None,
             link_capacity_estimate: None,
@@ -239,6 +245,13 @@ impl LossController {
         packet_results: &[impl PacketResult],
         delay_based_estimated: Bitrate,
     ) {
+        // The estimate in use: in `DelayBased` the delay-based one (what libWebRTC's
+        // result is in that state).
+        let previous_estimate = if self.state == LossControllerState::DelayBased {
+            Some(self.delay_based_estimate).filter(|e| e.is_valid())
+        } else {
+            self.loss_based_result().bandwidth_estimate
+        };
         self.delay_based_estimate = delay_based_estimated;
 
         if packet_results.is_empty() {
@@ -246,9 +259,34 @@ impl LossController {
             return;
         }
 
+        let loss_ratio_before = self.average_reported_loss_ratio();
         if !self.maybe_add_observation(packet_results) {
             return;
         }
+
+        // Only an observation that raises the loss of the window lowers the estimate below
+        // the one in use, and then at most to the acked rate at that observation. This
+        // deviates from libWebRTC, where the acked rate bounds the estimate from below at
+        // every update. After a congestion loss burst the average loss of the window, and
+        // with it the instant upper bound, stays at the level of the burst for as long as
+        // its observations are in the window, while the acked rate is that of now. The
+        // acked rate measures the path only while the sender fills it; an application
+        // limited sender (say at 0.8 x the estimate) is acked what it sends, so each
+        // update would lower the estimate to the acked rate, the sender follows, and the
+        // estimate ratchets down until the burst has left the window, also when random
+        // loss leaves no observation loss free. An observation whose loss ratio is not
+        // above the window's average (no loss, or the random loss the window already
+        // shows) is no evidence of a lower capacity and holds the estimate. One with more
+        // loss than the window is, and the acked rate then is what the congested path
+        // delivered. The delay-based estimate still lowers the estimate.
+        let newest = (self.num_observations - 1) as usize % self.config.observation_window_size;
+        let raises_loss = self.observations[newest].loss_ratio(self.config.use_byte_loss_ratio)
+            > loss_ratio_before;
+        self.estimate_floor = match previous_estimate {
+            Some(estimate) if raises_loss => estimate.min(self.get_instant_lower_bound()),
+            Some(estimate) => estimate,
+            None => Bitrate::ZERO,
+        };
 
         if !self.current_estimate.loss_limited_bandwidth.is_valid() {
             warn!("estimator must be initialized before use");
@@ -457,19 +495,21 @@ impl LossController {
     }
 
     /// Bound a loss limited bandwidth by the delay-based estimate and the instant bounds.
+    /// It is not below `estimate_floor` (unless the delay-based estimate is), whatever the
+    /// instant upper bound.
     fn bound_estimate(&self, loss_limited_bandwidth: Bitrate) -> Bitrate {
         let instant_upper_bound = self.get_instant_upper_bound();
         let instant_lower_bound = self.get_instant_lower_bound();
 
+        let loss_bounded = loss_limited_bandwidth
+            .min(instant_upper_bound)
+            .max(self.estimate_floor);
         if self.delay_based_estimate.is_valid() {
-            loss_limited_bandwidth
+            loss_bounded
                 .min(self.delay_based_estimate)
-                .min(instant_upper_bound)
                 .max(instant_lower_bound)
         } else {
-            loss_limited_bandwidth
-                .min(instant_upper_bound)
-                .max(instant_lower_bound)
+            loss_bounded.max(instant_lower_bound)
         }
     }
 
@@ -1024,6 +1064,16 @@ struct Observation {
 }
 
 impl Observation {
+    /// The lost share of the observation, by bytes or by packets as the window's average.
+    fn loss_ratio(&self, use_byte_loss_ratio: bool) -> f64 {
+        let (lost, total) = if use_byte_loss_ratio {
+            (self.lost_size.as_bytes_f64(), self.size.as_bytes_f64())
+        } else {
+            (self.num_lost_packets as f64, self.num_packets as f64)
+        };
+        if total > 0.0 { lost / total } else { 0.0 }
+    }
+
     pub const DUMMY: Self = Self {
         num_packets: 0,
         size: DataSize::ZERO,
@@ -1570,11 +1620,11 @@ mod test {
     }
 
     /// Drive `lbc` through `phases` in the order `SendSideBandwidthEstimator`
-    /// feeds it, calling `check(t, acked, result)` after every batch.
+    /// feeds it, calling `check(t, acked, result, observation)` after every batch.
     fn simulate(
         lbc: &mut LossController,
         phases: &[Phase],
-        mut check: impl FnMut(f64, Bitrate, &LossBasedBweResult),
+        mut check: impl FnMut(f64, Bitrate, &LossBasedBweResult, Option<Completed>),
     ) {
         let start = Instant::now();
         let batch = Duration::from_millis(50);
@@ -1606,7 +1656,9 @@ mod test {
                 let delay_based = Bitrate::kbps(phase.delay_kbps);
                 lbc.set_alr_start_time(phase.alr.then_some(start));
                 lbc.set_acknowledged_bitrate(acked);
+                let observations = lbc.num_observations;
                 lbc.update_bandwidth_estimate(&packets, delay_based);
+                let completed = Completed::of(lbc, observations);
                 // As SendSideBandwidthEstimator::update: the delay-based
                 // estimate caps the loss-based one.
                 if let Some(estimate) = lbc.loss_based_result().bandwidth_estimate {
@@ -1615,8 +1667,27 @@ mod test {
                     }
                 }
                 t += batch;
-                check(t.as_secs_f64(), acked, &lbc.loss_based_result());
+                check(t.as_secs_f64(), acked, &lbc.loss_based_result(), completed);
             }
+        }
+    }
+
+    /// The observation an update completed.
+    #[derive(Debug, Clone, Copy)]
+    struct Completed {
+        /// Whether a packet in it was lost.
+        lossy: bool,
+    }
+
+    impl Completed {
+        /// The newest observation of `lbc` if there are more than `before`.
+        fn of(lbc: &LossController, before: u64) -> Option<Completed> {
+            (lbc.num_observations > before).then(|| {
+                let newest = (lbc.num_observations - 1) as usize % lbc.observations.len();
+                Completed {
+                    lossy: lbc.observations[newest].num_lost_packets > 0,
+                }
+            })
         }
     }
 
@@ -1646,7 +1717,7 @@ mod test {
         let mut lbc = LossController::new();
         lbc.set_bandwidth_estimate(Bitrate::mbps(60));
         let mut loss_limited = false;
-        simulate(&mut lbc, &phases, |t, acked, result| {
+        simulate(&mut lbc, &phases, |t, acked, result, _| {
             if result.state == LossControllerState::DelayBased {
                 return;
             }
@@ -1662,67 +1733,117 @@ mod test {
 
     /// A closed loop of an application limited sender, its pacer and a link: media at
     /// `MEDIA_SHARE` of the estimate, padded up to the pacer's padding rate, on a link of
-    /// `capacity_kbps(t)` that drops what is sent above it. The acked rate is what got
-    /// through in the last 150 ms. Calls `check(t, acked, result)` after every 50 ms batch.
+    /// `link.capacity_kbps(t)` that drops what is sent above it (evenly spread) and of the
+    /// rest each packet with probability `link.random_loss` (seeded, so runs repeat). The
+    /// acked rate is what got through in the last 150 ms. The sender's estimate is
+    /// `Bwe::last_estimate`'s. Calls `check` after every 50 ms batch.
     fn simulate_paced(
         lbc: &mut LossController,
         secs: f64,
-        delay_kbps: u64,
-        capacity_kbps: impl Fn(f64) -> f64,
-        mut check: impl FnMut(f64, Bitrate, &LossBasedBweResult),
+        link: &Link,
+        mut check: impl FnMut(&Tick),
     ) {
         const MEDIA_SHARE: f64 = 0.8;
         let pacer = PacerControl::new();
         let start = Instant::now();
         let batch = Duration::from_millis(50);
         let size = DataSize::bytes(1200);
-        let delay_based = Bitrate::kbps(delay_kbps);
         let mut t = Duration::ZERO;
         let (mut packets_due, mut losses_due) = (0.0, 0.0);
         let mut delivered_kbps = [0.0; 3];
+        let mut delay_based = Bitrate::kbps((link.delay_kbps)(0.0));
+        let mut rng = Rng::with_seed(34791910);
         while t.as_secs_f64() < secs {
             let result = lbc.loss_based_result();
-            let estimate = result.bandwidth_estimate.expect("an estimate");
+            let estimate = last_estimate(&result, delay_based);
             let padding = loss_recovery_padding_rate(result.state, estimate, Bitrate::INFINITY);
             let padding_rate = pacer
                 .calculate(true, estimate, false, Bitrate::ZERO, padding)
                 .padding_rate;
-            let send_kbps = (estimate.as_f64() * MEDIA_SHARE).max(padding_rate.as_f64()) / 1000.0;
-            let capacity = capacity_kbps(t.as_secs_f64());
-            let loss = ((send_kbps - capacity) / send_kbps).max(0.0);
+            let send_kbps = (link.send_kbps)(t.as_secs_f64())
+                .unwrap_or((estimate.as_f64() * MEDIA_SHARE).max(padding_rate.as_f64()) / 1000.0);
+            let capacity = (link.capacity_kbps)(t.as_secs_f64());
+            delay_based = Bitrate::kbps((link.delay_kbps)(t.as_secs_f64()));
+            let overflow = ((send_kbps - capacity) / send_kbps).max(0.0);
 
             packets_due += send_kbps * 1000.0 * batch.as_secs_f64() / (size.as_bytes_f64() * 8.0);
             let n = packets_due as u32;
             packets_due -= n as f64;
             let packets: Vec<_> = (0..n)
                 .map(|i| {
-                    losses_due += loss;
-                    let lost = losses_due >= 1.0;
-                    if lost {
+                    losses_due += overflow;
+                    let dropped = losses_due >= 1.0;
+                    if dropped {
                         losses_due -= 1.0;
                     }
                     PacketResult {
                         local_send_time: start + t + batch * i / n,
                         size,
-                        lost,
+                        lost: dropped || rng.f64() < link.random_loss,
                     }
                 })
                 .collect();
             delivered_kbps.rotate_left(1);
-            delivered_kbps[2] = send_kbps * (1.0 - loss);
+            delivered_kbps[2] = send_kbps * (1.0 - overflow) * (1.0 - link.random_loss);
             let acked = Bitrate::kbps((delivered_kbps.iter().sum::<f64>() / 3.0) as u64);
 
-            lbc.set_alr_start_time(None);
+            lbc.set_alr_start_time((link.alr)(t.as_secs_f64()).then_some(start));
             lbc.set_acknowledged_bitrate(acked);
+            let observations = lbc.num_observations;
             lbc.update_bandwidth_estimate(&packets, delay_based);
+            let completed = Completed::of(lbc, observations);
             if let Some(estimate) = lbc.loss_based_result().bandwidth_estimate {
                 if estimate > delay_based {
                     lbc.set_bandwidth_estimate(delay_based);
                 }
             }
             t += batch;
-            check(t.as_secs_f64(), acked, &lbc.loss_based_result());
+            let result = lbc.loss_based_result();
+            check(&Tick {
+                t: t.as_secs_f64(),
+                acked,
+                estimate: last_estimate(&result, delay_based),
+                state: result.state,
+                completed,
+            });
         }
+    }
+
+    /// As `Bwe::last_estimate`: the delay-based estimate, capped by the loss-based one
+    /// unless that is in `DelayBased`.
+    fn last_estimate(result: &LossBasedBweResult, delay_based: Bitrate) -> Bitrate {
+        let loss_based = result.bandwidth_estimate.expect("an estimate");
+        if result.state == LossControllerState::DelayBased {
+            delay_based
+        } else {
+            loss_based.min(delay_based)
+        }
+    }
+
+    /// One `simulate_paced` batch.
+    #[derive(Debug, Clone, Copy)]
+    struct Tick {
+        t: f64,
+        acked: Bitrate,
+        /// The estimate the sender follows.
+        estimate: Bitrate,
+        state: LossControllerState,
+        /// The observation the batch completed.
+        completed: Option<Completed>,
+    }
+
+    /// The path of `simulate_paced`, as functions of the time in seconds.
+    struct Link {
+        /// What the link delivers; the rest of the send is lost.
+        capacity_kbps: Box<dyn Fn(f64) -> f64>,
+        /// The delay-based estimate.
+        delay_kbps: Box<dyn Fn(f64) -> u64>,
+        /// A send rate that overrides the sender's (one that has not reacted yet).
+        send_kbps: Box<dyn Fn(f64) -> Option<f64>>,
+        /// Random loss: the fraction of what fits the link that is lost anyway.
+        random_loss: f64,
+        /// Whether the sender is in ALR.
+        alr: Box<dyn Fn(f64) -> bool>,
     }
 
     /// The run of `padding_lifts_app_limited_estimate_after_loss`.
@@ -1764,8 +1885,18 @@ mod test {
                 LossControllerState::DelayBased,
             ),
         };
-        simulate_paced(&mut lbc, 16.0, 8_000, capacity, |t, acked, result| {
-            let estimate = result.bandwidth_estimate.unwrap();
+        let link = Link {
+            capacity_kbps: Box::new(capacity),
+            delay_kbps: Box::new(|_| 8_000),
+            send_kbps: Box::new(|_| None),
+            random_loss: 0.0,
+            alr: Box::new(|_| false),
+        };
+        simulate_paced(&mut lbc, 16.0, &link, |tick| {
+            let &Tick {
+                t, acked, estimate, ..
+            } = tick;
+            let result = tick;
             run.padded |= result.state == LossControllerState::IncreaseUsingPadding;
             if t > 5.0 {
                 run.lowest = run.lowest.min(estimate);
@@ -1905,6 +2036,345 @@ mod test {
             !run.iter()
                 .any(|r| r.1 == LossControllerState::IncreaseUsingPadding)
         );
+    }
+
+    /// An application limited sender at 0.8 x the estimate (14 Mbps) whose 20 Mbps path
+    /// drops to 8 Mbps at 5 s. For 1 s the sender has not reacted and loses 43 %; from 6 s
+    /// it follows the estimate. `capacity_after` and `delay_after` give the link and the
+    /// delay-based estimate from 5 s.
+    fn app_limited_after_loss(
+        secs: f64,
+        capacity_after: impl Fn(f64) -> f64 + 'static,
+        delay_after: impl Fn(f64) -> u64 + 'static,
+    ) -> Vec<Tick> {
+        let mut lbc = LossController::new();
+        lbc.set_bandwidth_estimate(Bitrate::kbps(17_500));
+        let link = Link {
+            capacity_kbps: Box::new(move |t| if t < 5.0 { 20_000.0 } else { capacity_after(t) }),
+            delay_kbps: Box::new(move |t| if t < 5.0 { 17_500 } else { delay_after(t) }),
+            send_kbps: Box::new(|t| (5.0..6.0).contains(&t).then_some(14_000.0)),
+            random_loss: 0.0,
+            alr: Box::new(|_| false),
+        };
+        let mut run = vec![];
+        simulate_paced(&mut lbc, secs, &link, |tick| {
+            if let Some(completed) = tick.completed {
+                println!(
+                    "{:5.2} {:>14} acked {:>14} {:?} lossy {}",
+                    tick.t,
+                    tick.estimate.to_string(),
+                    tick.acked.to_string(),
+                    tick.state,
+                    completed.lossy
+                );
+            }
+            run.push(*tick);
+        });
+        run
+    }
+
+    /// The delay-based estimate after the drop to 8 Mbps at 5 s: cut to 9.4 and 7.47 Mbps
+    /// (as on the rig), then an additive increase of 250 kbps/s.
+    fn rig_delay(t: f64) -> u64 {
+        if t < 5.5 {
+            9_400
+        } else {
+            7_470 + (250.0 * (t - 5.5)) as u64
+        }
+    }
+
+    /// The index of the step after the last lossy observation of the first run of lossy
+    /// observations, and the index of the next lossy observation (or the end).
+    fn loss_free_span(run: &[Tick]) -> (usize, usize) {
+        let lossy = |s: &Tick| s.completed.is_some_and(|c| c.lossy);
+        let loss_free = |s: &Tick| s.completed.is_some_and(|c| !c.lossy);
+        let first_loss = run.iter().position(lossy).expect("loss");
+        let end_of_loss = first_loss
+            + run[first_loss..]
+                .iter()
+                .position(loss_free)
+                .expect("loss ends");
+        let next_loss = run[end_of_loss..]
+            .iter()
+            .position(lossy)
+            .map_or(run.len(), |i| end_of_loss + i);
+        (end_of_loss, next_loss)
+    }
+
+    #[test]
+    fn loss_free_observations_do_not_lower_loss_limited_estimate() {
+        // After the loss the sender is below the link and nothing is lost. The acked
+        // rate follows the sender, which follows the estimate: if loss-free observations
+        // lowered the estimate to the acked rate, it would ratchet down.
+        let run = app_limited_after_loss(14.0, |_| 8_000.0, rig_delay);
+        let (end_of_loss, next_loss) = loss_free_span(&run);
+        let at_end = run[end_of_loss - 1].estimate;
+        let lowest = run[end_of_loss..next_loss]
+            .iter()
+            .fold(Bitrate::INFINITY, |m, s| m.min(s.estimate));
+        println!(
+            "loss ended at {:.2} s at {at_end}, lowest after {lowest}, next loss {:?}",
+            run[end_of_loss].t,
+            run.get(next_loss).map(|s| s.t)
+        );
+        assert!(
+            lowest >= at_end,
+            "the estimate fell from {at_end} to {lowest} without loss"
+        );
+        let padding = end_of_loss
+            + run[end_of_loss..next_loss]
+                .iter()
+                .position(|s| s.state == LossControllerState::IncreaseUsingPadding)
+                .expect("padding after the loss");
+        let recovered = run[padding..next_loss]
+            .iter()
+            .find(|s| s.estimate > at_end * 1.1)
+            .expect("the estimate should rise through padding");
+        println!(
+            "padding from {:.2} s, {} at {:.2} s",
+            run[padding].t, recovered.estimate, recovered.t
+        );
+    }
+
+    #[test]
+    fn continued_loss_still_lowers_estimate() {
+        // A sender that stays above a link shrinking from 8 to 2.4 Mbps: in `Decreasing`
+        // every lossy observation at a lower acked rate lowers the estimate.
+        let phases: Vec<_> = (0..15)
+            .map(|i| {
+                let acked = 8_000 - 400 * i;
+                Phase {
+                    secs: 0.3,
+                    send_kbps: 14_000.0,
+                    loss: 1.0 - acked as f64 / 14_000.0,
+                    acked_kbps: acked,
+                    delay_kbps: 60_000,
+                    alr: false,
+                }
+            })
+            .collect();
+        let mut lbc = LossController::new();
+        lbc.set_bandwidth_estimate(Bitrate::mbps(17));
+        let (mut previous, mut previous_acked) = (Bitrate::INFINITY, Bitrate::INFINITY);
+        let mut lowered = 0;
+        simulate(&mut lbc, &phases, |t, acked, result, completed| {
+            let estimate = result.bandwidth_estimate.unwrap();
+            if !completed.is_some_and(|c| c.lossy) {
+                return;
+            }
+            if result.state == LossControllerState::Decreasing && acked < previous_acked {
+                assert!(
+                    estimate < previous,
+                    "at {t:.2} s a lossy observation left the estimate at {estimate} (acked {acked})"
+                );
+                lowered += 1;
+            }
+            (previous, previous_acked) = (estimate, acked);
+        });
+        println!("lowered {lowered} times, to {previous}");
+        assert!(lowered >= 10, "only {lowered} lowering observations");
+    }
+
+    #[test]
+    fn loss_after_loss_free_observations_lowers_estimate() {
+        // The path drops further to 3 Mbps at 7 s, while the estimate is held after the
+        // first loss: the new loss lowers it again.
+        let run =
+            app_limited_after_loss(9.0, |t| if t < 7.0 { 8_000.0 } else { 3_000.0 }, rig_delay);
+        let (_, next_loss) = loss_free_span(&run);
+        assert!(next_loss < run.len(), "the 3 Mbps link should cause loss");
+        let before = run[next_loss - 1].estimate;
+        let lowest = run[next_loss..]
+            .iter()
+            .fold(Bitrate::INFINITY, |m, s| m.min(s.estimate));
+        println!("before the new loss {before}, lowest after {lowest}");
+        assert!(run[next_loss].t > 7.0);
+        assert!(
+            lowest < Bitrate::kbps(3_500) && lowest < before * 0.5,
+            "loss on a 3 Mbps link should lower {before}, lowest {lowest}"
+        );
+    }
+
+    #[test]
+    fn delay_based_estimate_caps_held_estimate() {
+        // Without loss, a falling delay-based estimate still lowers the result.
+        let run = app_limited_after_loss(
+            9.0,
+            |_| 8_000.0,
+            |t| if t < 7.0 { rig_delay(t) } else { 2_000 },
+        );
+        for &Tick { t, estimate, .. } in &run {
+            if t > 7.05 {
+                assert!(
+                    estimate <= Bitrate::kbps(2_000),
+                    "at {t:.2} s the estimate {estimate} is above the delay-based 2 Mbps"
+                );
+            }
+        }
+    }
+
+    /// The delay-based estimate around a 20 -> 8 Mbps cut at 5 s, as read from a rig log
+    /// where the estimate was not loss limited: 8005 kbps after the cut, 6695 kbps from 1 s
+    /// after it, rising again from 10 s (500 kbps/s, here up to 8.5 Mbps).
+    fn cut_delay(t: f64) -> u64 {
+        if t < 5.0 {
+            17_500
+        } else if t < 6.0 {
+            8_005
+        } else if t < 10.0 {
+            6_695
+        } else {
+            (6_695.0 + 500.0 * (t - 10.0)).min(8_500.0) as u64
+        }
+    }
+
+    /// An application limited sender in ALR at 0.8 x the estimate (14 Mbps) with
+    /// `random_loss` on a 20 Mbps link that drops to `capacity_after(t)` at 5 s. As on the
+    /// rig, ALR ends at the cut (which resets the observation window) and the sender reacts
+    /// only after 1 s (43 % loss), then follows the estimate. The delay-based estimate is
+    /// `cut_delay`.
+    fn stray_loss_after_cut(
+        secs: f64,
+        random_loss: f64,
+        capacity_after: impl Fn(f64) -> f64 + 'static,
+    ) -> Vec<Tick> {
+        let mut lbc = LossController::new();
+        lbc.set_bandwidth_estimate(Bitrate::kbps(17_500));
+        let link = Link {
+            capacity_kbps: Box::new(move |t| if t < 5.0 { 20_000.0 } else { capacity_after(t) }),
+            delay_kbps: Box::new(cut_delay),
+            send_kbps: Box::new(|t| (5.0..6.0).contains(&t).then_some(14_000.0)),
+            random_loss,
+            alr: Box::new(|t| t < 5.0),
+        };
+        let mut run = vec![];
+        simulate_paced(&mut lbc, secs, &link, |tick| {
+            if tick.completed.is_some() {
+                println!(
+                    "{:5.2} {:>14} acked {:>14} {:?}",
+                    tick.t,
+                    tick.estimate.to_string(),
+                    tick.acked.to_string(),
+                    tick.state,
+                );
+            }
+            run.push(*tick);
+        });
+        run
+    }
+
+    /// How long observations stay in the window at least, in seconds.
+    fn window_secs() -> f64 {
+        let config = super::Config::default();
+        config.observation_window_size as f64
+            * config.observation_duration_lower_bound.as_secs_f64()
+    }
+
+    /// The mean acked rate over `from..to` seconds of `run`.
+    fn mean_acked(run: &[Tick], from: f64, to: f64) -> Bitrate {
+        let acked: Vec<f64> = run
+            .iter()
+            .filter(|s| s.t > from && s.t <= to)
+            .map(|s| s.acked.as_f64())
+            .collect();
+        Bitrate::bps((acked.iter().sum::<f64>() / acked.len() as f64) as u64)
+    }
+
+    #[test]
+    fn stray_loss_does_not_ratchet_estimate_after_congestion() {
+        // After the burst every observation still loses a packet or two (1 % random loss),
+        // so none is loss free, while the burst keeps the average loss of the window high.
+        // The acked rate then measures the sender, not the path. While the burst is in the
+        // window the estimate stays at what the path delivered during the burst (unless the
+        // delay-based estimate is lower), and once it has left the estimate recovers.
+        let run = stray_loss_after_cut(16.0, 0.01, |_| 8_000.0);
+        let burst = mean_acked(&run, 5.0, 6.0);
+        let window = window_secs();
+        let after: Vec<&Tick> = run.iter().filter(|s| s.t > 6.0).collect();
+        let lowest = after
+            .iter()
+            .filter(|s| s.t < 6.0 + window)
+            .fold(Bitrate::INFINITY, |m, s| m.min(s.estimate));
+        let recovered = after
+            .iter()
+            .find(|s| s.state == LossControllerState::DelayBased)
+            .map(|s| s.t);
+        println!(
+            "burst delivered {burst}, lowest while in the window {lowest}, delay based at \
+             {recovered:?}"
+        );
+        for s in after.iter().filter(|s| s.t < 6.0 + window) {
+            let delay_based = Bitrate::kbps(cut_delay(s.t));
+            assert!(
+                s.estimate >= burst.min(delay_based),
+                "at {:.2} s the estimate {} is below the {burst} delivered in the burst",
+                s.t,
+                s.estimate
+            );
+        }
+        let recovered = recovered.expect("the estimate should recover");
+        assert!(
+            recovered < 6.0 + window + 2.0,
+            "delay based again at {recovered:.2} s"
+        );
+    }
+
+    #[test]
+    fn deeper_cut_lowers_estimate_held_after_burst() {
+        // A second cut, to 4 Mbps at 7.5 s, while the first burst is still in the window:
+        // the new loss is congestion, and the estimate follows the path down to what it
+        // delivers, not further down with the sender.
+        let cut = 7.5;
+        let link = Bitrate::kbps(4_000);
+        let run =
+            stray_loss_after_cut(12.0, 0.01, move |t| if t < cut { 8_000.0 } else { 4_000.0 });
+        let below = run
+            .iter()
+            .position(|s| s.t > cut && s.estimate <= link)
+            .expect("the estimate should follow the second cut");
+        let observations = run[..=below]
+            .iter()
+            .filter(|s| s.t > cut && s.completed.is_some())
+            .count();
+        // While the loss of the cut is in the window.
+        let lowest = run[below..]
+            .iter()
+            .filter(|s| s.t < run[below].t + window_secs())
+            .fold(Bitrate::INFINITY, |m, s| m.min(s.estimate));
+        println!(
+            "at or below {link} at {:.2} s after {observations} observations, lowest {lowest}",
+            run[below].t
+        );
+        assert!(
+            observations <= 3,
+            "{observations} observations to follow the cut"
+        );
+        // The sender at 0.8 x the estimate: lower, and the estimate followed the sender.
+        assert!(lowest >= link * 0.8, "the estimate fell to {lowest}");
+    }
+
+    #[test]
+    fn random_loss_without_congestion_keeps_delay_based_estimate() {
+        // 1 % random loss on a 20 Mbps link the sender never fills: no congestion, so
+        // the estimate stays the delay-based one.
+        let mut lbc = LossController::new();
+        lbc.set_bandwidth_estimate(Bitrate::kbps(17_500));
+        let link = Link {
+            capacity_kbps: Box::new(|_| 20_000.0),
+            delay_kbps: Box::new(|_| 17_500),
+            send_kbps: Box::new(|_| None),
+            random_loss: 0.01,
+            alr: Box::new(|_| true),
+        };
+        simulate_paced(&mut lbc, 20.0, &link, |tick| {
+            assert_eq!(
+                tick.estimate,
+                Bitrate::kbps(17_500),
+                "at {:.2} s ({:?})",
+                tick.t,
+                tick.state
+            );
+        });
     }
 
     struct PacketBuilder {

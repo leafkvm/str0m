@@ -320,6 +320,12 @@ impl LossController {
             }
         }
 
+        // Never below what the path demonstrably delivered (WebRTC: lower bound
+        // by acked rate).
+        best_candidate.loss_limited_bandwidth = best_candidate
+            .loss_limited_bandwidth
+            .max(self.get_instant_lower_bound());
+
         let loss_limited_bandwidth = best_candidate.loss_limited_bandwidth;
 
         // HOLD check (WebRTC lines 321-334): If in Decreasing state and HOLD timer active, cap at HOLD rate
@@ -327,6 +333,8 @@ impl LossController {
             && self.last_hold_info.timestamp > self.last_send_time_most_recent_observation
             && loss_limited_bandwidth < self.delay_based_estimate
         {
+            // Ensure that the acked rate is the lower bound of the HOLD rate.
+            self.last_hold_info.rate = self.last_hold_info.rate.max(self.get_instant_lower_bound());
             // During HOLD period, cap estimate at HOLD rate
             self.current_estimate = best_candidate;
             self.current_estimate.loss_limited_bandwidth =
@@ -418,15 +426,21 @@ impl LossController {
             return result;
         };
         let instant_upper_bound = self.get_instant_upper_bound();
+        let instant_lower_bound = self.get_instant_lower_bound();
 
         if self.delay_based_estimate.is_valid() {
             result.bandwidth_estimate = Some(
                 loss_limited_bandwidth
                     .min(self.delay_based_estimate)
-                    .min(instant_upper_bound),
+                    .min(instant_upper_bound)
+                    .max(instant_lower_bound),
             )
         } else {
-            result.bandwidth_estimate = Some(loss_limited_bandwidth.min(instant_upper_bound))
+            result.bandwidth_estimate = Some(
+                loss_limited_bandwidth
+                    .min(instant_upper_bound)
+                    .max(instant_lower_bound),
+            )
         }
 
         result
@@ -794,6 +808,19 @@ impl LossController {
         instant_limit
     }
 
+    fn get_instant_lower_bound(&self) -> Bitrate {
+        let mut lower_bound = Bitrate::ZERO;
+        if self.acknowledged_bitrate.is_valid()
+            && self.config.lower_bound_by_acked_rate_factor > 0.0
+        {
+            lower_bound = self.acknowledged_bitrate * self.config.lower_bound_by_acked_rate_factor;
+        }
+        if self.min_bitrate.is_valid() {
+            lower_bound = lower_bound.max(self.min_bitrate);
+        }
+        lower_bound
+    }
+
     fn get_instant_upper_bound(&self) -> Bitrate {
         self.cached_instant_upper_bound
             .as_valid()
@@ -890,6 +917,7 @@ struct Config {
     bandwidth_preference_smoothing_factor: f64,
     use_byte_loss_ratio: bool,
     hold_duration_factor: f64,
+    lower_bound_by_acked_rate_factor: f64,
     bandwidth_rampup_hold_threshold: f64,
     bandwidth_rampup_upper_bound_factor_in_hold: f64,
 }
@@ -1079,6 +1107,7 @@ impl Default for Config {
             bandwidth_preference_smoothing_factor: 0.002,
             use_byte_loss_ratio: true,
             hold_duration_factor: 2.0,
+            lower_bound_by_acked_rate_factor: 1.0,
             bandwidth_rampup_hold_threshold: 1.3,
             bandwidth_rampup_upper_bound_factor_in_hold: 1.2,
         }
@@ -1235,6 +1264,8 @@ mod test {
         }
 
         pkt_builder = pkt_builder.with_loss(0.9);
+        // The receiver only gets 10 % of the 1 Mbps.
+        lbc.set_acknowledged_bitrate(Bitrate::kbps(100));
         // Loss spike(1second at 90% loss)
         for _ in 0..4 {
             let result = pkt_builder.build_packets();
@@ -1340,7 +1371,9 @@ mod test {
 
         // Gradual increase
         for inc in 0..10 {
-            pkt_builder = pkt_builder.with_loss(0.05 + (inc as f64 / 10.0));
+            let loss = 0.05 + (inc as f64 / 10.0);
+            pkt_builder = pkt_builder.with_loss(loss);
+            lbc.set_acknowledged_bitrate(acknowledged_bitrate * (1.0 - loss));
 
             for _ in 0..4 {
                 let result = pkt_builder.build_packets();
@@ -1385,6 +1418,8 @@ mod test {
         let loss_limited = {
             // loss spike observation at 50%
             pkt_builder = pkt_builder.with_loss(0.5);
+            // The receiver only gets half of the 1 Mbps.
+            lbc.set_acknowledged_bitrate(Bitrate::kbps(500));
             let result = pkt_builder.build_packets();
             lbc.update_bandwidth_estimate(&result, Bitrate::bps(1_500_000));
             pkt_builder = pkt_builder.forward_time(Duration::from_millis(250));
@@ -1421,9 +1456,10 @@ mod test {
 
             let estimate = bandwidth_estimate.expect("Should have an estimate");
             assert!(
-                estimate > loss_limited && estimate <= Bitrate::mbps(1),
-                "During the recovery window after a loss spike the estimate should increase, \
-                    but be bounded. loss_limited={}, estimate={}, expected <= 1 Mbps",
+                estimate >= loss_limited && estimate <= Bitrate::mbps(1),
+                "During the recovery window after a loss spike the estimate should not decrease \
+                    (it is held at the HOLD rate), and be bounded. loss_limited={}, estimate={}, \
+                    expected <= 1 Mbps",
                 loss_limited,
                 estimate
             );
@@ -1448,8 +1484,112 @@ mod test {
                 "Eventually the estimate should recover but still remain bounded until the \
                     average loss caused by spike ages out"
             );
-            assert_eq!(state, LossControllerState::Decreasing);
+            // Up from the HOLD rate, still loss limited.
+            assert_eq!(state, LossControllerState::Increasing);
         }
+    }
+
+    /// One phase of a simulated send: `send_kbps` in 50 ms feedback batches of
+    /// 1200 byte packets, a `loss` fraction of them lost, with the acked rate,
+    /// delay-based estimate and ALR state fed before every batch.
+    struct Phase {
+        secs: f64,
+        send_kbps: f64,
+        loss: f64,
+        acked_kbps: u64,
+        delay_kbps: u64,
+        alr: bool,
+    }
+
+    /// Drive `lbc` through `phases` in the order `SendSideBandwidthEstimator`
+    /// feeds it, calling `check(t, acked, result)` after every batch.
+    fn simulate(
+        lbc: &mut LossController,
+        phases: &[Phase],
+        mut check: impl FnMut(f64, Bitrate, &LossBasedBweResult),
+    ) {
+        let start = Instant::now();
+        let batch = Duration::from_millis(50);
+        let size = DataSize::bytes(1200);
+        let mut t = Duration::ZERO;
+        let (mut packets_due, mut losses_due) = (0.0, 0.0);
+        for phase in phases {
+            let end = t + Duration::from_secs_f64(phase.secs);
+            while t < end {
+                packets_due +=
+                    phase.send_kbps * 1000.0 * batch.as_secs_f64() / (size.as_bytes_f64() * 8.0);
+                let n = packets_due as u32;
+                packets_due -= n as f64;
+                let packets: Vec<_> = (0..n)
+                    .map(|i| {
+                        losses_due += phase.loss;
+                        let lost = losses_due >= 1.0;
+                        if lost {
+                            losses_due -= 1.0;
+                        }
+                        PacketResult {
+                            local_send_time: start + t + batch * i / n,
+                            size,
+                            lost,
+                        }
+                    })
+                    .collect();
+                let acked = Bitrate::kbps(phase.acked_kbps);
+                let delay_based = Bitrate::kbps(phase.delay_kbps);
+                lbc.set_alr_start_time(phase.alr.then_some(start));
+                lbc.set_acknowledged_bitrate(acked);
+                lbc.update_bandwidth_estimate(&packets, delay_based);
+                // As SendSideBandwidthEstimator::update: the delay-based
+                // estimate caps the loss-based one.
+                if let Some(estimate) = lbc.loss_based_result().bandwidth_estimate {
+                    if estimate > delay_based {
+                        lbc.set_bandwidth_estimate(delay_based);
+                    }
+                }
+                t += batch;
+                check(t.as_secs_f64(), acked, &lbc.loss_based_result());
+            }
+        }
+    }
+
+    #[test]
+    fn estimate_not_lower_than_acked_rate_on_rate_limited_path() {
+        // An application limited sender at 14 Mbps whose path drops to 8 Mbps:
+        // 43 % loss for 1.5 s while the delay-based estimate falls and the
+        // receiver still gets 7-9 Mbps, then the sender backs off to 3 Mbps
+        // without loss.
+        // (secs, send kbps, loss, acked kbps, delay-based kbps, ALR)
+        let phases = [
+            (10.0, 14_000.0, 0.0, 14_000, 60_000, true),
+            (0.5, 14_000.0, 0.43, 9_100, 9_400, false),
+            (1.0, 14_000.0, 0.43, 7_400, 7_470, false),
+            (5.0, 3_000.0, 0.0, 3_000, 7_470, false),
+        ]
+        .map(
+            |(secs, send_kbps, loss, acked_kbps, delay_kbps, alr)| Phase {
+                secs,
+                send_kbps,
+                loss,
+                acked_kbps,
+                delay_kbps,
+                alr,
+            },
+        );
+        let mut lbc = LossController::new();
+        lbc.set_bandwidth_estimate(Bitrate::mbps(60));
+        let mut loss_limited = false;
+        simulate(&mut lbc, &phases, |t, acked, result| {
+            if result.state == LossControllerState::DelayBased {
+                return;
+            }
+            loss_limited = true;
+            let estimate = result.bandwidth_estimate.expect("an estimate");
+            assert!(
+                estimate >= acked,
+                "at {t:.2} s the loss-based estimate {estimate} is below the acked rate {acked}"
+            );
+        });
+        assert!(loss_limited, "the loss should limit the estimate");
     }
 
     struct PacketBuilder {

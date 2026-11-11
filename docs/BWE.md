@@ -278,7 +278,8 @@ conditions improve).
 The controller estimates the inherent loss rate of the link over an
 observation window, establishing a baseline for expected packet loss. When
 observed loss exceeds this inherent rate, it signals congestion and
-reduces the bandwidth estimate accordingly. The controller includes a Hold
+reduces the bandwidth estimate accordingly. As in libwebrtc, the estimate
+is never below the acknowledged bitrate. The controller includes a Hold
 mechanism to prevent rapid ramp-up immediately after loss events—loss often
 indicates we've already exceeded capacity, so we need time to verify the
 network has recovered before growing again.

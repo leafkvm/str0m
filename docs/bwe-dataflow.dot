@@ -28,7 +28,6 @@ digraph BWE_DataFlow {
 
     // ALR system
     ALR [label="ALR\nDetector", style=filled, fillcolor=wheat];
-    LCE [label="Link Capacity\nEstimator", style=filled, fillcolor=wheat];
 
     // Pacer system
     Pacer [label="Pacer\n(LeakyBucket +\nProbeClusterState)", style=filled, fillcolor=palegreen];
@@ -71,8 +70,6 @@ digraph BWE_DataFlow {
     ALR -> PC [label="ALR state\n(start time)"];
     ALR -> LC [label="ALR state\n(start time)"];
     SSBE -> ALR [label="media sent"];
-    PE -> LCE [label="ALR probe results", color=orange];
-    LCE -> LC [label="capacity estimate", color=orange, penwidth=2];
 
     // Pacer control
     PacerCtrl -> Pacer [label="pacing_rate\npadding_rate"];
@@ -106,7 +103,7 @@ digraph BWE_DataFlow {
         label="ALR System";
         style=dashed;
         color=orange;
-        ALR; LCE;
+        ALR;
     }
 }
 

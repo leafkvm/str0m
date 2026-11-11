@@ -37,7 +37,8 @@ pub struct ProbeClusterConfig {
     /// leave by the rate schedule (`next_probe_time()`), not this spacing.
     min_probe_delta: Duration,
 
-    /// The kind of probe this is.
+    /// The kind of probe this is. Outside tests only shown in the `Debug` output.
+    #[cfg_attr(not(any(test, feature = "_internal_test_exports")), allow(dead_code))]
     kind: ProbeKind,
 }
 
@@ -53,6 +54,7 @@ pub enum ProbeKind {
     Stagnant,
 }
 
+#[cfg(any(test, feature = "_internal_test_exports"))]
 impl ProbeKind {
     pub(crate) fn is_alr(&self) -> bool {
         matches!(
@@ -99,6 +101,7 @@ impl ProbeClusterConfig {
     }
 
     /// Check if this probe was created during ALR.
+    #[cfg(any(test, feature = "_internal_test_exports"))]
     pub fn is_alr_probe(&self) -> bool {
         self.kind.is_alr()
     }

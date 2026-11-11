@@ -18,9 +18,7 @@ use super::time::{TimeDelta, Timestamp};
 /// Estimation of an assumed Bernoulli distribution. This allows it to distinguish congestion
 /// induced loss from this inherent loss.
 ///
-/// The controller integrates with ALR (Application Limited Region) detection and link capacity
-/// tracking. When in ALR, it uses proven link capacity from successful ALR probes as an upper
-/// bound on estimates, preventing overestimation in application-limited scenarios. When
+/// The controller integrates with ALR (Application Limited Region) detection. When
 /// transitioning into or out of ALR, the controller resets its observation window to avoid
 /// mixing traffic patterns from different network utilization regimes.
 ///
@@ -91,12 +89,6 @@ pub struct LossController {
     /// `bound_estimate` stays at or above it, unless the delay-based estimate is lower.
     estimate_floor: Bitrate,
 
-    /// ALR start time (None if not in ALR)
-    alr_start_time: Option<Instant>,
-
-    /// Link capacity estimate from probes during ALR
-    link_capacity_estimate: Option<Bitrate>,
-
     /// Previous ALR state to detect transitions
     was_in_alr: bool,
 }
@@ -157,8 +149,6 @@ impl LossController {
             last_padding_info: PaddingInfo::default(),
             estimate_floor: Bitrate::ZERO,
 
-            alr_start_time: None,
-            link_capacity_estimate: None,
             was_in_alr: false,
 
             config,
@@ -207,18 +197,7 @@ impl LossController {
             );
         }
 
-        self.alr_start_time = alr_start;
         self.was_in_alr = is_in_alr;
-    }
-
-    /// Set link capacity estimate from successful ALR probes.
-    pub fn set_link_capacity_estimate(&mut self, capacity: Option<Bitrate>) {
-        self.link_capacity_estimate = capacity;
-    }
-
-    /// Check if currently in ALR state
-    fn is_in_alr(&self) -> bool {
-        self.alr_start_time.is_some()
     }
 
     /// Reset all observations.
@@ -791,16 +770,6 @@ impl LossController {
 
     fn get_candidate_bandwidth_upper_bound(&self) -> Bitrate {
         let mut upper_bound = self.max_bitrate;
-
-        // When in ALR and we have a link capacity estimate from probes,
-        // use it as the upper bound. This prevents estimating beyond proven capacity.
-        if self.is_in_alr() {
-            if let Some(capacity) = self.link_capacity_estimate {
-                if capacity.is_valid() {
-                    upper_bound = upper_bound.min(capacity);
-                }
-            }
-        }
 
         if self.is_bandwidth_limited_due_to_loss()
             && self.bandwidth_limit_in_current_window.is_valid()
@@ -2036,6 +2005,103 @@ mod test {
             !run.iter()
                 .any(|r| r.1 == LossControllerState::IncreaseUsingPadding)
         );
+    }
+
+    /// An application limited sender in ALR at 0.8 x the estimate on a 20 Mbps link with
+    /// 1 % random loss and a delay-based estimate of 17.5 Mbps. The link drops to 8 Mbps
+    /// from 10 to 12 s, which the delay-based estimate does not see.
+    fn app_limited_with_random_loss(lbc: &mut LossController, secs: f64) -> Vec<Tick> {
+        lbc.set_bandwidth_estimate(Bitrate::kbps(17_500));
+        let cut = |t| (10.0..12.0).contains(&t);
+        let link = Link {
+            capacity_kbps: Box::new(move |t| if cut(t) { 8_000.0 } else { 20_000.0 }),
+            delay_kbps: Box::new(|_| 17_500),
+            send_kbps: Box::new(|_| None),
+            random_loss: 0.01,
+            alr: Box::new(|_| true),
+        };
+        let mut run = vec![];
+        let mut last = None;
+        simulate_paced(lbc, secs, &link, |tick| {
+            if last != Some(tick.state) {
+                println!(
+                    "{:5.2} {:>14} acked {:>14} {:?}",
+                    tick.t,
+                    tick.estimate.to_string(),
+                    tick.acked.to_string(),
+                    tick.state
+                );
+            }
+            last = Some(tick.state);
+            run.push(*tick);
+        });
+        run
+    }
+
+    #[test]
+    fn app_limited_estimate_recovers_to_delay_based_estimate_after_cut() {
+        // The cut makes the estimate loss limited. With the random loss continuing, it
+        // recovers through padding, up to the delay-based estimate, and stays there.
+        // (`alr_probe_result_does_not_cap_loss_limited_recovery` in `bwe` checks the same
+        // recovery against an ALR probe result.)
+        let mut lbc = LossController::new();
+        let run = app_limited_with_random_loss(&mut lbc, 30.0);
+
+        let loss_limited = |s: &Tick| s.state != LossControllerState::DelayBased;
+        let first = run.iter().position(loss_limited).expect("loss limited");
+        assert!(run[first].t > 10.0, "loss limited before the cut");
+        let recovered = run[first..]
+            .iter()
+            .find(|s| !loss_limited(s) && s.estimate == Bitrate::kbps(17_500))
+            .map(|s| s.t);
+        let end = run.last().unwrap();
+        println!(
+            "loss limited at {:.2} s, recovered at {recovered:?}, end {} {:?}",
+            run[first].t, end.estimate, end.state
+        );
+        let recovered = recovered.expect("the estimate should reach the delay-based estimate");
+        assert!(
+            !run[first..]
+                .iter()
+                .any(|s| s.t > recovered && loss_limited(s)),
+            "loss limited again after the recovery"
+        );
+    }
+
+    #[test]
+    fn congestion_loss_in_alr_lowers_estimate() {
+        // The same sender and random loss, with the link dropping to 8 Mbps at 5 s and a
+        // delay-based estimate that does not react: the loss alone brings the estimate
+        // down to what the link delivers. Padding may then test above the link, by at most
+        // the increase bound while loss limited (1.2 x the acked rate in HOLD).
+        let mut lbc = LossController::new();
+        lbc.set_bandwidth_estimate(Bitrate::kbps(17_500));
+        let link = Link {
+            capacity_kbps: Box::new(|t| if t < 5.0 { 20_000.0 } else { 8_000.0 }),
+            delay_kbps: Box::new(|_| 17_500),
+            send_kbps: Box::new(|_| None),
+            random_loss: 0.01,
+            alr: Box::new(|_| true),
+        };
+        let link_kbps = Bitrate::kbps(8_000);
+        let padding_bound = link_kbps * lbc.config.bandwidth_rampup_upper_bound_factor_in_hold;
+        let mut below_at = None;
+        simulate_paced(&mut lbc, 20.0, &link, |tick| {
+            if tick.t > 5.0 && below_at.is_none() && tick.estimate <= link_kbps {
+                println!("{:.2} s {} {:?}", tick.t, tick.estimate, tick.state);
+                below_at = Some(tick.t);
+            }
+            if below_at.is_some() {
+                assert!(
+                    tick.estimate <= padding_bound,
+                    "at {:.2} s the estimate {} is back above the link by more than padding",
+                    tick.t,
+                    tick.estimate
+                );
+            }
+        });
+        let below_at = below_at.expect("the estimate should come down");
+        assert!(below_at < 7.0, "below the link at {below_at:.2} s");
     }
 
     /// An application limited sender at 0.8 x the estimate (14 Mbps) whose 20 Mbps path

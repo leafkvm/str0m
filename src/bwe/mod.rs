@@ -8,7 +8,6 @@
 //! - Loss-based control (with inherent loss rate estimation)
 //! - Probe controller with state machine and multi-stage probing strategy
 //! - ALR (Application Limited Region) detection and periodic probing
-//! - Link capacity estimation from ALR probes
 //!
 //! The probe controller in particular closely matches WebRTC's `ProbeController` behavior
 //! and default constants, enabling compatible bandwidth discovery with WebRTC endpoints.
@@ -25,7 +24,6 @@ mod acked_bitrate_estimator;
 mod alr_detector;
 pub(crate) mod api;
 mod delay;
-mod link_capacity_estimator;
 mod loss_controller;
 mod macros;
 mod probe;
@@ -35,7 +33,6 @@ mod time;
 use acked_bitrate_estimator::AckedBitrateEstimator;
 use alr_detector::AlrDetector;
 use delay::DelayController;
-use link_capacity_estimator::LinkCapacityEstimator;
 use loss_controller::{LossController, LossControllerState};
 use macros::log_loss;
 use smoother::EstimateSmoother;
@@ -155,7 +152,6 @@ struct SendSideBandwidthEstimator {
     // First nonempty transport feedback; starts loss estimation and enables ALR probing.
     started_at: Option<Instant>,
     alr_detector: AlrDetector,
-    link_capacity_estimator: LinkCapacityEstimator,
     last_updated_estimate: Option<(Bitrate, BandwidthLimitedCause)>,
 }
 
@@ -178,7 +174,6 @@ impl SendSideBandwidthEstimator {
             probe_estimator: ProbeEstimator::new(),
             started_at: None,
             alr_detector,
-            link_capacity_estimator: LinkCapacityEstimator::new(),
             last_updated_estimate: None,
         }
     }
@@ -209,16 +204,8 @@ impl SendSideBandwidthEstimator {
 
         // Feed records to probe estimator for analysis and process any new probe results
         let mut latest_probe_result = None;
-        for (config, bitrate) in self.probe_estimator.update(send_records.iter().copied()) {
+        for (_, bitrate) in self.probe_estimator.update(send_records.iter().copied()) {
             latest_probe_result = Some(bitrate);
-
-            // Update link capacity estimator for every successful ALR probe, not just the latest.
-            // The estimator internally takes the max of all probe results, building up knowledge
-            // of proven link capacity. This differs from the delay controller, which only receives
-            // the latest probe result (matching WebRTC's FetchAndResetLastEstimatedBitrate behavior).
-            if config.is_alr_probe() {
-                self.link_capacity_estimator.update_from_probe(bitrate, now);
-            }
         }
 
         let mut acked_packets = vec![];
@@ -336,11 +323,6 @@ impl SendSideBandwidthEstimator {
         }
 
         self.loss_controller.set_alr_start_time(alr_start_time);
-
-        // Get link capacity estimate and forward to loss controller.
-        let link_capacity = self.link_capacity_estimator.capacity_estimate(now);
-        self.loss_controller
-            .set_link_capacity_estimate(link_capacity);
 
         // Clean up expired probe cluster state
         self.probe_estimator.handle_timeout(now);
@@ -625,9 +607,13 @@ mod test {
         /// When the link's queue empties.
         queue_free: Instant,
         seq: u64,
-        /// Sent packets not yet reported: sequence number, send and receive time.
-        in_flight: Vec<(u64, Instant, Instant)>,
+        /// Sent packets not yet reported: id, send and receive time, and whether it is lost.
+        in_flight: Vec<(TwccPacketId, Instant, Instant, bool)>,
         next_report: Instant,
+        /// Every `lose_every`th packet is lost (none when zero).
+        lose_every: u64,
+        /// The probe cluster sent packets belong to.
+        cluster: Option<TwccClusterId>,
     }
 
     impl Link {
@@ -640,6 +626,8 @@ mod test {
                 seq: 0,
                 in_flight: vec![],
                 next_report: start,
+                lose_every: 0,
+                cluster: None,
             }
         }
 
@@ -655,11 +643,16 @@ mod test {
             let end = self.t + Duration::from_secs_f64(secs);
             while self.t < end {
                 let sent = self.start + self.t;
+                self.seq += 1;
+                let id = match self.cluster {
+                    Some(cluster) => TwccPacketId::with_cluster(self.seq, cluster),
+                    None => TwccPacketId::new(self.seq),
+                };
                 let received = self.queue_free.max(sent) + size / link;
                 self.queue_free = received;
-                self.seq += 1;
                 let remote_recv = received + Duration::from_millis(20);
-                self.in_flight.push((self.seq, sent, remote_recv));
+                let lost = self.lose_every > 0 && self.seq.is_multiple_of(self.lose_every);
+                self.in_flight.push((id, sent, remote_recv, lost));
                 self.t += size / send;
                 let now = self.start + self.t;
                 if now < self.next_report {
@@ -669,14 +662,8 @@ mod test {
                 let report: Vec<_> = self
                     .in_flight
                     .drain(..arrived)
-                    .map(|(seq, sent, recv)| {
-                        TwccSendRecord::test_new(
-                            TwccPacketId::new(seq),
-                            sent,
-                            1200,
-                            now,
-                            Some(recv),
-                        )
+                    .map(|(id, sent, recv, lost)| {
+                        TwccSendRecord::test_new(id, sent, 1200, now, (!lost).then_some(recv))
                     })
                     .collect();
                 bwe.update(report.iter(), now);
@@ -855,6 +842,49 @@ mod test {
                 Bitrate::ZERO
             );
         }
+    }
+
+    #[test]
+    fn alr_probe_result_does_not_cap_loss_limited_recovery() {
+        // An application limited sender at 0.8 x the estimate, padding while the loss
+        // controller recovers, on a 20 Mbps link with 1 % random loss. An ALR probe at
+        // 14 Mbps measures the sender, not the link. The random loss makes the estimate
+        // loss limited at times, and the padding recovery must be able to take it above the
+        // probe result, up to the delay-based estimate.
+        let mut bwe = SendSideBandwidthEstimator::new(Bitrate::mbps(10));
+        let mut link = Link::new();
+        link.lose_every = 100;
+        let desired = Bitrate::mbps(50);
+        let link_rate = Bitrate::mbps(20);
+        let step = |bwe: &mut SendSideBandwidthEstimator, link: &mut Link| {
+            let estimate = bwe.last_estimate().unwrap();
+            let state = bwe.loss_controller.loss_based_result().state;
+            let padding = loss_recovery_padding_rate(state, estimate, desired);
+            link.run(bwe, 0.05, (estimate * 0.8).max(padding), link_rate);
+        };
+        for _ in 0..100 {
+            step(&mut bwe, &mut link);
+        }
+
+        let probe_rate = Bitrate::mbps(14);
+        let cluster: TwccClusterId = 1.into();
+        let config = ProbeClusterConfig::new(cluster, probe_rate, ProbeKind::PeriodicAlr);
+        assert!(config.is_alr_probe());
+        assert!(bwe.start_probe(config, link.start + link.t));
+        link.cluster = Some(cluster);
+        link.run(&mut bwe, 0.03, probe_rate, link_rate);
+        link.cluster = None;
+
+        let mut highest = Bitrate::ZERO;
+        let mut loss_limited = false;
+        for _ in 0..200 {
+            step(&mut bwe, &mut link);
+            highest = highest.max(bwe.last_estimate().unwrap());
+            loss_limited |= bwe.is_loss_limited();
+        }
+        println!("highest estimate in the 10 s after the probe {highest}");
+        assert!(loss_limited, "precondition: loss limited at times");
+        assert!(highest > probe_rate, "held at the probe result: {highest}");
     }
 
     #[test]

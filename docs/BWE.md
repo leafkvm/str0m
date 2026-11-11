@@ -824,6 +824,23 @@ transmission smoothing and padding generation respectively.
      to within 10 %: 907 ms instead of 2703 ms); decreases are computed as
      before, and the steady-state spread is the same
 
+8. **Loss-Limited Cause Between Observations:**
+   - **WebRTC**: `LossBasedBweV2` leaves `kDelayBasedEstimate` only when its
+     bounded estimate is below the delay-based estimate, decided once per
+     observation (250 ms or more); between observations its state gives the
+     bandwidth-limited cause
+   - **str0m**: The estimate counts as loss limited only while the loss
+     controller is out of `DelayBased` and its estimate is below the current
+     delay-based estimate, compared on every feedback
+   - **Reason**: The delay-based estimate changes with every feedback. Once
+     an overuse has cut it below the loss-based estimate (which is never
+     below the acknowledged bitrate), the state from the last observation
+     reports a delay-based limit as a loss limit and blocks probes until the
+     next observation
+   - **Impact**: Probes are not blocked as loss limited while the delay-based
+     estimate is the lower one. Both report the overuse itself as delay
+     limited; only the time between its end and the next observation differs
+
 ### Shared with WebRTC
 
 - Core delay-based detection algorithm (trendline estimator with AIMD rate

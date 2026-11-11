@@ -1122,6 +1122,30 @@ mod test {
     }
 
     #[test]
+    fn no_periodic_alr_probe_while_loss_limited() {
+        // As libWebRTC's ProbeController: no probes while the loss-based estimate limits
+        // (kLossLimitedBwe), probes again when the delay-based estimate does.
+        let mut pc = ProbeControl::new();
+        pc.enable(true);
+        let now = Instant::now();
+
+        pc.set_desired_bitrate(Bitrate::mbps(5));
+        pc.set_estimated_bitrate(Bitrate::mbps(1), BandwidthLimitedCause::DelayBasedLimited);
+        let _ = pc.handle_timeout(now);
+        let _ = pc.handle_timeout(now);
+        assert!(pc.handle_timeout(now + Duration::from_secs(2)).is_none());
+        pc.set_alr_start_time(now + Duration::from_secs(2));
+        assert!(pc.handle_timeout(now + Duration::from_secs(2)).is_none());
+
+        pc.set_estimated_bitrate(Bitrate::mbps(1), BandwidthLimitedCause::LossLimitedBwe);
+        assert!(pc.handle_timeout(now + Duration::from_secs(7)).is_none());
+
+        pc.set_estimated_bitrate(Bitrate::mbps(1), BandwidthLimitedCause::DelayBasedLimited);
+        let probe = pc.handle_timeout(now + Duration::from_secs(7));
+        assert!(probe.is_some_and(|p| p.is_alr_probe()));
+    }
+
+    #[test]
     fn periodic_alr_probing_continues_even_when_estimate_reaches_max() {
         let mut pc = ProbeControl::new();
         pc.enable(true);

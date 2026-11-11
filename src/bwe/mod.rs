@@ -374,10 +374,34 @@ impl SendSideBandwidthEstimator {
         }
 
         match self.loss_controller.loss_based_result().state {
+            _ if !self.is_loss_limited() => BandwidthLimitedCause::DelayBasedLimited,
             LossControllerState::DelayBased => BandwidthLimitedCause::DelayBasedLimited,
             LossControllerState::Increasing => BandwidthLimitedCause::LossLimitedBweIncreasing,
             LossControllerState::Decreasing => BandwidthLimitedCause::LossLimitedBwe,
         }
+    }
+
+    /// Whether the loss-based estimate limits the estimate: the loss controller is out of
+    /// `DelayBased` and its estimate is below the delay-based one.
+    ///
+    /// libWebRTC's `LossBasedBweV2` leaves `kDelayBasedEstimate` only when its bounded
+    /// estimate is below the delay-based estimate, but decides that once per observation
+    /// (250 ms or more) while the delay-based estimate changes with every feedback. Here the
+    /// comparison is made with the current delay-based estimate. Otherwise, once an overuse
+    /// has cut the delay-based estimate below the loss-based one (which is never below the
+    /// acked rate), the state from the last observation reports a delay-based limit as a
+    /// loss limit, and keeps probes blocked, until the next observation. libWebRTC reports
+    /// the overuse itself as the cause (as `bandwidth_limited_cause` does), but not the
+    /// time between its end and the next observation.
+    fn is_loss_limited(&self) -> bool {
+        let result = self.loss_controller.loss_based_result();
+        if result.state == LossControllerState::DelayBased {
+            return false;
+        }
+        let delay_based = self.delay_controller.last_estimate();
+        result
+            .bandwidth_estimate
+            .is_some_and(|loss_based| delay_based.is_none_or(|d| loss_based < d))
     }
 
     /// Get the latest estimate.
@@ -663,6 +687,99 @@ mod test {
             bwe.probe_control.last_cause(),
             BandwidthLimitedCause::DelayBasedLimited
         );
+    }
+
+    /// Packets of 1200 bytes sent at `send_kbps` from `from` for `secs`, each `lose_every`th
+    /// one lost, as TWCC send records.
+    fn records(
+        start: Instant,
+        from: Duration,
+        secs: f64,
+        send_kbps: u64,
+        lose_every: u64,
+        seq: &mut u64,
+    ) -> Vec<TwccSendRecord> {
+        let size = 1200;
+        let interval = Duration::from_secs_f64(size as f64 * 8.0 / (send_kbps as f64 * 1000.0));
+        let n = (secs / interval.as_secs_f64()) as u32;
+        (0..n)
+            .map(|i| {
+                *seq += 1;
+                let sent = start + from + interval * i;
+                let recv = sent + Duration::from_millis(30);
+                let lost = (*seq).is_multiple_of(lose_every);
+                TwccSendRecord::test_new(
+                    TwccPacketId::new(*seq),
+                    sent,
+                    size,
+                    recv,
+                    (!lost).then_some(recv),
+                )
+            })
+            .collect()
+    }
+
+    /// An estimator whose delay controller is at `delay_estimate` and whose loss controller is
+    /// out of `DelayBased`: fed 3 s of 12 Mbps with 20 % loss and 10 Mbps acked against a
+    /// 20 Mbps delay-based estimate, then a 30 ms feedback, too short to complete an
+    /// observation, with the delay-based estimate at `delay_estimate` (in the order
+    /// `SendSideBandwidthEstimator::update` feeds it).
+    fn loss_controller_out_of_delay_based(delay_estimate: Bitrate) -> SendSideBandwidthEstimator {
+        let mut bwe = SendSideBandwidthEstimator::new(delay_estimate);
+        let lc = &mut bwe.loss_controller;
+        lc.set_bandwidth_estimate(Bitrate::mbps(20));
+        let start = Instant::now();
+        let mut seq = 0;
+        // Feedback of 300 ms: each completes an observation (250 ms).
+        let batch = Duration::from_millis(300);
+        let mut t = Duration::ZERO;
+        while t < Duration::from_secs(3) {
+            let records = records(start, t, 0.3, 12_000, 5, &mut seq);
+            lc.set_acknowledged_bitrate(Bitrate::mbps(10));
+            lc.update_bandwidth_estimate(&records.iter().collect::<Vec<_>>(), Bitrate::mbps(20));
+            t += batch;
+        }
+        let state = lc.loss_based_result().state;
+        assert_ne!(state, LossControllerState::DelayBased, "precondition");
+        let records = records(start, t, 0.03, 12_000, 5, &mut seq);
+        lc.update_bandwidth_estimate(&records.iter().collect::<Vec<_>>(), delay_estimate);
+        assert_eq!(lc.loss_based_result().state, state, "precondition");
+        bwe
+    }
+
+    #[test]
+    fn delay_dip_below_loss_estimate_is_not_loss_limited() {
+        // A delay overuse cut the delay-based estimate to 8.5 Mbps, below the 10 Mbps acked
+        // rate and so below the loss-based estimate, before the loss controller completed its
+        // next observation: the delay-based estimate limits the estimate.
+        let delay = Bitrate::kbps(8_554);
+        let bwe = loss_controller_out_of_delay_based(delay);
+        let loss = bwe.loss_controller.loss_based_result();
+        println!("loss-based {loss:?}");
+        assert!(loss.bandwidth_estimate.unwrap() > delay);
+        assert_eq!(bwe.last_estimate(), Some(delay));
+        assert!(!bwe.is_loss_limited());
+        assert_eq!(
+            bwe.bandwidth_limited_cause(),
+            BandwidthLimitedCause::DelayBasedLimited
+        );
+    }
+
+    #[test]
+    fn loss_estimate_below_delay_estimate_is_loss_limited() {
+        // The same loss controller against a 20 Mbps delay-based estimate limits the estimate.
+        let delay = Bitrate::mbps(20);
+        let bwe = loss_controller_out_of_delay_based(delay);
+        let loss = bwe.loss_controller.loss_based_result();
+        println!("loss-based {loss:?}");
+        let loss_estimate = loss.bandwidth_estimate.unwrap();
+        assert!(loss_estimate < delay);
+        assert_eq!(bwe.last_estimate(), Some(loss_estimate));
+        assert!(bwe.is_loss_limited());
+        assert!(matches!(
+            bwe.bandwidth_limited_cause(),
+            BandwidthLimitedCause::LossLimitedBwe | BandwidthLimitedCause::LossLimitedBweIncreasing
+        ));
     }
 
     #[test]

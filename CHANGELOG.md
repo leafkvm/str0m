@@ -1,5 +1,6 @@
 # Unreleased
 
+  * Treat the estimate as loss limited only while the loss-based estimate is below the delay-based one
   * Keep 10 000 TWCC send records, so feedback for a deep queue still finds its packets
   * Put the local ICE candidates on the first BUNDLE m-line that is not rejected
   * Request a keyframe when a NACK names a packet that is no longer cached

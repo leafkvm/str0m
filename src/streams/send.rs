@@ -148,6 +148,10 @@ pub struct StreamTx {
     /// Determines retransmitted bytes ratio value to clear queued resends.
     rtx_ratio_cap: Option<f32>,
 
+    /// The last sent seq_no when an unrepairable NACK last raised a keyframe
+    /// request (see [`Self::unrepairable`]).
+    unrepairable_keyframe_seq: Option<SeqNo>,
+
     /// Last time we produced a SR.
     last_sender_report: Instant,
 
@@ -383,6 +387,7 @@ impl StreamTx {
             rtx_ratio_cap: DEFAULT_RTX_RATIO_CAP,
             last_sender_report: already_happened(),
             pending_request_keyframe: None,
+            unrepairable_keyframe_seq: None,
             pending_request_remb: None,
             stats: StreamTxStats::new(enable_stats),
             rtx_ratio: (0.0, already_happened()),
@@ -1066,6 +1071,7 @@ impl StreamTx {
         for seq_no in iter {
             let Some(packet) = self.rtx_cache.get_cached_packet_by_seq_no(seq_no) else {
                 // Packet was not available in RTX cache, it has probably expired.
+                self.unrepairable(seq_no);
                 continue;
             };
 
@@ -1078,6 +1084,19 @@ impl StreamTx {
         }
 
         Some(())
+    }
+
+    /// The receiver NACKed packet `seq_no`, which is not cached (any more): it cannot be
+    /// repaired, so request a keyframe now, as a PLI would. A receiver may wait much longer
+    /// before it sends a PLI itself (Chrome: 3 s without a decodable frame). Once per span of
+    /// sent packets: holes up to the last seq_no sent at the previous request are healed by
+    /// the keyframe that request produces.
+    fn unrepairable(&mut self, seq_no: SeqNo) {
+        if self.unrepairable_keyframe_seq.is_none_or(|k| seq_no > k) {
+            self.unrepairable_keyframe_seq = Some(self.last_sent_seq_no);
+            self.pending_request_keyframe = Some(KeyframeRequestKind::Pli);
+            debug!("NACK for uncached seq {}: keyframe request", *seq_no);
+        }
     }
 
     pub(crate) fn need_sr(&self, now: Instant, intervals: RtcpReportIntervals) -> bool {

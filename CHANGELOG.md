@@ -1,5 +1,6 @@
 # Unreleased
 
+  * Request a keyframe when a NACK names a packet that is no longer cached
   * Forward a changed bandwidth-limited cause to the probe controller with an unchanged estimate
   * Release a requested probe burst at once, not `min_probe_delta` after the request
   * Space large-drop probes from the last drop probe, as libwebrtc does

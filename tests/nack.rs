@@ -103,6 +103,63 @@ fn nack_receive_retransmits_without_another_timeout() -> Result<(), RtcError> {
     panic!("queued NACK was not received");
 }
 
+/// A NACK for a packet that is not in the RTX cache cannot be repaired by a resend: the
+/// sender gets a keyframe request at once, once for the hole (not for each NACK retry).
+#[test]
+pub fn nack_for_uncached_packet_requests_keyframe() -> Result<(), RtcError> {
+    init_log();
+    init_crypto_default();
+
+    let (mut l, mut r) = connect_l_r();
+    let mid = "vid".into();
+    let ssrc_tx: Ssrc = 42.into();
+    let ssrc_rtx: Ssrc = 44.into();
+    l.direct_api().declare_media(mid, MediaKind::Video);
+    l.direct_api()
+        .declare_stream_tx(ssrc_tx, Some(ssrc_rtx), mid, None);
+    r.direct_api().declare_media(mid, MediaKind::Video);
+    r.direct_api()
+        .expect_stream_rx(ssrc_tx, Some(ssrc_rtx), mid, None);
+    let max = l.last.max(r.last);
+    l.last = max;
+    r.last = max;
+    let pt = l.params_vp8().pt();
+
+    // Packet 47_050 is never sent, so it is not in the RTX cache when R NACKs it.
+    for index in 0..200 {
+        if index == 50 {
+            continue;
+        }
+        let wallclock = l.start + l.duration();
+        let mut direct = l.direct_api();
+        let stream = direct.stream_tx(&ssrc_tx).unwrap();
+        let time = (index * 1000 + 47_000_000) as u32;
+        let seq_no = (47_000 + index as u64).into();
+        stream.write_rtp(RtpWrite::new(pt, seq_no, time, wallclock, [1, 2, 3, 4]).nackable(true));
+        progress(&mut l, &mut r)?;
+    }
+    let settle = l.duration() + Duration::from_secs(2);
+    while l.duration() < settle {
+        progress(&mut l, &mut r)?;
+    }
+
+    let nacks = l
+        .events
+        .iter()
+        .filter(|(_, e)| matches!(e.as_raw_packet(), Some(RawPacket::RtcpRx(Rtcp::Nack(_)))))
+        .count();
+    let requests = l
+        .events
+        .iter()
+        .filter(|(_, e)| matches!(e, Event::KeyframeRequest(req) if req.mid == mid))
+        .count();
+    println!("{nacks} NACKs received, {requests} keyframe requests");
+    assert!(nacks > 1, "R should NACK the hole, and retry");
+    assert_eq!(requests, 1);
+
+    Ok(())
+}
+
 #[test]
 pub fn loss_recovery() -> Result<(), RtcError> {
     init_log();

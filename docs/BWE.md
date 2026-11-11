@@ -157,6 +157,11 @@ groups during high-bitrate streaming, it caps group duration at 100ms
 (`MAX_BURST_DURATION`), ensuring we don't wait too long between congestion
 measurements.
 
+As in libwebrtc, send times are rounded to whole milliseconds (from a fixed
+origin), so packets sent in the same millisecond always share a group. The
+burst rule ("arrived closer together than sent") compares the arrival
+spacing with the unrounded send spacing (see Deviations).
+
 Each completed group pair produces an `InterGroupDelayDelta` containing
 the time between sending the two groups (`send_delta`), the time between
 receiving them (`arrival_delta`), and the timestamp of the last remote
@@ -841,6 +846,25 @@ transmission smoothing and padding generation respectively.
      estimate is the lower one. Both report the overuse itself as delay
      limited; only the time between its end and the next observation differs
 
+9. **Burst Rule on Unrounded Send Times:**
+   - **WebRTC**: `InterArrivalDelta::BelongsToBurst` compares the arrival
+     spacing (TWCC, 250 µs resolution) with the send spacing in whole
+     milliseconds (`SentPacket::send_time_ms`)
+   - **str0m**: Send times are rounded to milliseconds as in libwebrtc for
+     the "same send time" rule and for the group send times, but the burst
+     rule compares the arrival spacing with the unrounded send spacing
+   - **Reason**: Packets sent back to back step the rounded send time by
+     0 or 1 ms. At a bottleneck that serializes a packet in under 1 ms, a
+     1 ms step always reads as compression, so with a standing queue nearly
+     every packet joins the current group: groups grow to the 100 ms burst
+     limit and the delay detector gets about 10 observations per second
+     instead of one per send group, just while the queue builds
+   - **Impact**: A standing queue yields an observation per send group
+     (10 → 99 per second in `standing_queue_is_not_one_burst`); packets
+     sent in the same millisecond still share a group. A release burst after
+     an outage, which arrives like a draining queue, is grouped by the 5 ms
+     send-time rule where its packets straddle a millisecond boundary
+
 ### Shared with WebRTC
 
 - Core delay-based detection algorithm (trendline estimator with AIMD rate
@@ -854,7 +878,8 @@ transmission smoothing and padding generation respectively.
 - Transport-feedback requirement before periodic ALR probing
 - Large-drop recovery probing (85% of pre-drop rate)
 - Bandwidth-limited-cause gating for probing
-- Arrival group formation rules
+- Arrival group formation rules, including millisecond send times (the
+  burst rule compares unrounded send spacing, see Deviations)
 - Probe bitrate estimation (send/recv rate calculation and ratio
   validation)
 - Acked bitrate estimation (Bayesian smoothing; the sample uncertainty of

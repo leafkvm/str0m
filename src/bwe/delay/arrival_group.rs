@@ -15,6 +15,8 @@ pub struct ArrivalGroup {
     first: Option<(TwccSeq, Instant, Instant)>,
     last_seq_no: Option<TwccSeq>,
     last_local_send_time: Option<Instant>,
+    /// The latest send time before rounding to milliseconds, for the burst rule.
+    last_exact_send_time: Option<Instant>,
     last_remote_recv_time: Option<Instant>,
     size: usize,
 }
@@ -22,9 +24,11 @@ pub struct ArrivalGroup {
 impl ArrivalGroup {
     /// Maybe add a packet to the group.
     ///
+    /// `exact_send_time` is the packet's send time before rounding to milliseconds.
+    ///
     /// Returns [`true`] if a new group needs to be created and [`false`] otherwise.
-    fn add_packet(&mut self, packet: &AckedPacket) -> bool {
-        match self.belongs_to_group(packet) {
+    fn add_packet(&mut self, packet: &AckedPacket, exact_send_time: Instant) -> bool {
+        match self.belongs_to_group(packet, exact_send_time) {
             Belongs::NewGroup => return true,
             Belongs::Skipped => return false,
             Belongs::Yes => {}
@@ -42,13 +46,14 @@ impl ArrivalGroup {
             .last_remote_recv_time
             .max(Some(packet.remote_recv_time));
         self.last_local_send_time = self.last_local_send_time.max(Some(packet.local_send_time));
+        self.last_exact_send_time = self.last_exact_send_time.max(Some(exact_send_time));
         self.size += 1;
         self.last_seq_no = self.last_seq_no.max(Some(packet.seq_no));
 
         false
     }
 
-    fn belongs_to_group(&self, packet: &AckedPacket) -> Belongs {
+    fn belongs_to_group(&self, packet: &AckedPacket, exact_send_time: Instant) -> Belongs {
         let Some((_, first_local_send_time, first_remote_recv_time)) = self.first else {
             // Start of the group
             return Belongs::Yes;
@@ -68,7 +73,18 @@ impl ArrivalGroup {
         }
         let arrival_time_delta = Timestamp::from(packet.remote_recv_time) - self.remote_recv_time();
 
-        let propagation_delta = arrival_time_delta - send_time_delta;
+        // The burst rule asks whether the path compressed the packets: whether they arrived
+        // closer together than they were sent. Compare the arrival spacing with the send
+        // spacing at the same precision, not with the rounded one: packets sent back to back
+        // step the rounded send time by 0 or 1 ms, so at a bottleneck that serializes a
+        // packet in under 1 ms every such step would read as compression, and a standing
+        // queue would merge into MAX_BURST_DURATION groups.
+        let exact_send_time_delta = Timestamp::from(exact_send_time)
+            - Timestamp::from(
+                self.last_exact_send_time
+                    .expect("a group with a first packet has a send time"),
+            );
+        let propagation_delta = arrival_time_delta - exact_send_time_delta;
         if propagation_delta < TimeDelta::ZERO
             && arrival_time_delta <= BURST_TIME_INTERVAL
             && packet.remote_recv_time - first_remote_recv_time < MAX_BURST_DURATION
@@ -142,7 +158,8 @@ impl ArrivalGroupAccumulator {
         // Channel outages can queue packets and release them in a compressed burst. Tiny
         // send-time differences can split that burst into extra delay observations and
         // contribute to false overuse detections. Millisecond send times let the zero-delta
-        // rule in belongs_to_group keep packets sent together in the same group.
+        // rule in belongs_to_group keep packets sent together in the same group. The burst
+        // rule there compares arrival spacing with the unrounded send spacing.
         // GCC's motivation for burst grouping:
         // https://datatracker.ietf.org/doc/html/draft-ietf-rmcat-gcc-02#section-5.2
         //
@@ -152,6 +169,7 @@ impl ArrivalGroupAccumulator {
         // https://webrtc.googlesource.com/src/+/bef233bc69712a4976442f980b1355b990c1107b
         // Use one origin across groups so rounding boundaries stay fixed. Our origin
         // differs from WebRTC's clock epoch, so individual group boundaries may differ.
+        let exact_send_time = packet.local_send_time;
         let origin = *self.send_time_origin.get_or_insert(packet.local_send_time);
         let elapsed = packet.local_send_time.checked_duration_since(origin)?;
         let rounded_ms = (elapsed.as_micros() + 500) / 1000;
@@ -160,7 +178,7 @@ impl ArrivalGroupAccumulator {
             ..*packet
         };
 
-        let need_new_group = self.current_group.add_packet(&packet);
+        let need_new_group = self.current_group.add_packet(&packet, exact_send_time);
 
         if !need_new_group {
             return None;
@@ -174,7 +192,7 @@ impl ArrivalGroupAccumulator {
         let current_group = mem::take(&mut self.current_group);
         self.previous_group = Some(current_group);
 
-        self.current_group.add_packet(&packet);
+        self.current_group.add_packet(&packet, exact_send_time);
 
         Some(InterGroupDelayDelta {
             send_delta: send_delta?,
@@ -215,6 +233,32 @@ mod test {
     use crate::rtp_::DataSize;
 
     use super::{AckedPacket, ArrivalGroup, ArrivalGroupAccumulator, Belongs, TimeDelta};
+
+    #[test]
+    fn standing_queue_is_not_one_burst() {
+        // Paced chunks of 12 x 1200 B every 5 ms (23 Mbit/s), each chunk sent back to back
+        // (90 us apart), into a 20 Mbit/s bottleneck: a standing queue, arrivals 480 us
+        // apart. The path spread these packets out rather than compressing them, so the
+        // groups follow the send groups instead of merging into MAX_BURST_DURATION bursts.
+        let now = Instant::now();
+        let mut groups = ArrivalGroupAccumulator::default();
+        let mut arrival_us = 0u64;
+        let mut deltas = 0;
+        for i in 0..2400u64 {
+            let send_us = (i / 12) * 5_000 + (i % 12) * 90 + 137;
+            arrival_us = (arrival_us + 480).max(send_us + 30_000);
+            let delta = groups.accumulate_packet(&AckedPacket {
+                seq_no: i.into(),
+                size: DataSize::bytes(1200),
+                local_send_time: now + Duration::from_micros(send_us),
+                remote_recv_time: now + Duration::from_micros(arrival_us),
+                local_recv_time: now + Duration::from_micros(arrival_us + 30_000),
+            });
+            deltas += delta.is_some() as usize;
+        }
+        // 1 s of sending in 200 send groups: at least one observation per 10 ms.
+        assert!(deltas >= 90, "{deltas} delay observations");
+    }
 
     #[test]
     fn send_timestamps_round_to_nearest_millisecond() {
@@ -308,13 +352,16 @@ mod test {
         let group = ArrivalGroup::default();
 
         assert_eq!(
-            group.belongs_to_group(&AckedPacket {
-                seq_no: 1.into(),
-                size: DataSize::ZERO,
-                local_send_time: now,
-                remote_recv_time: now + duration_us(10),
-                local_recv_time: now + duration_us(12),
-            }),
+            group.belongs_to_group(
+                &AckedPacket {
+                    seq_no: 1.into(),
+                    size: DataSize::ZERO,
+                    local_send_time: now,
+                    remote_recv_time: now + duration_us(10),
+                    local_recv_time: now + duration_us(12),
+                },
+                now
+            ),
             Belongs::Yes,
             "Any packet should belong to an empty arrival group"
         );
@@ -374,9 +421,9 @@ mod test {
         let mut group = ArrivalGroup::default();
 
         for p in packets {
-            let need_new_group = group.belongs_to_group(&p).new_group();
+            let need_new_group = group.belongs_to_group(&p, p.local_send_time).new_group();
             if !need_new_group {
-                group.add_packet(&p);
+                group.add_packet(&p, p.local_send_time);
             }
         }
 
@@ -446,9 +493,9 @@ mod test {
         let mut group = ArrivalGroup::default();
 
         for p in packets {
-            let need_new_group = group.belongs_to_group(&p).new_group();
+            let need_new_group = group.belongs_to_group(&p, p.local_send_time).new_group();
             if !need_new_group {
-                group.add_packet(&p);
+                group.add_packet(&p, p.local_send_time);
             }
         }
 
@@ -502,9 +549,9 @@ mod test {
         let mut group = ArrivalGroup::default();
 
         for p in packets {
-            let need_new_group = group.belongs_to_group(&p).new_group();
+            let need_new_group = group.belongs_to_group(&p, p.local_send_time).new_group();
             if !need_new_group {
-                group.add_packet(&p);
+                group.add_packet(&p, p.local_send_time);
             }
         }
 

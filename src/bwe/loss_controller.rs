@@ -1720,7 +1720,7 @@ mod test {
             let estimate = last_estimate(&result, delay_based);
             let padding = loss_recovery_padding_rate(result.state, estimate, Bitrate::INFINITY);
             let padding_rate = pacer
-                .calculate(true, estimate, false, Bitrate::ZERO, padding)
+                .calculate(true, estimate, false, Bitrate::ZERO, padding, Bitrate::ZERO)
                 .padding_rate;
             let send_kbps = (link.send_kbps)(t.as_secs_f64())
                 .unwrap_or((estimate.as_f64() * MEDIA_SHARE).max(padding_rate.as_f64()) / 1000.0);

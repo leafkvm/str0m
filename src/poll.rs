@@ -277,6 +277,20 @@ mod tests {
     }
 
     #[test]
+    fn readiness_bwe_set_pacing_floor_only_wakes_timeout() {
+        let mut rtc = idle_rtc();
+        rtc.bwe().set_pacing_floor(Bitrate::mbps(1));
+        assert!(!rtc.readiness.wants_events());
+        assert!(rtc.readiness.wants_timeout());
+        assert!(
+            rtc.session.poll_event().is_none(),
+            "no hidden event behind the narrowed flag"
+        );
+        let expected = rtc.poll_timeout();
+        assert!(matches!(rtc.poll_output().unwrap(), Output::Timeout(at) if at == expected));
+    }
+
+    #[test]
     fn readiness_bwe_reset_only_wakes_timeout() {
         let mut rtc = idle_rtc();
         rtc.bwe().reset(Bitrate::kbps(900));

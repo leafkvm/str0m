@@ -56,6 +56,7 @@ pub struct Bwe {
     bwe: SendSideBandwidthEstimator,
     desired_bitrate: Bitrate,
     minimum_bitrate: Bitrate,
+    pacing_floor: Bitrate,
     smoother: EstimateSmoother,
 }
 
@@ -66,6 +67,7 @@ impl Bwe {
             bwe: send_side_bwe,
             desired_bitrate: Bitrate::ZERO,
             minimum_bitrate: Bitrate::ZERO,
+            pacing_floor: Bitrate::ZERO,
             smoother: EstimateSmoother::new(),
         }
     }
@@ -128,6 +130,14 @@ impl Bwe {
 
     pub fn minimum_bitrate(&self) -> Bitrate {
         self.minimum_bitrate
+    }
+
+    pub fn set_pacing_floor(&mut self, floor: Bitrate) {
+        self.pacing_floor = floor;
+    }
+
+    pub fn pacing_floor(&self) -> Bitrate {
+        self.pacing_floor
     }
 
     /// A read-only snapshot of the estimator's state.
@@ -946,8 +956,10 @@ mod test {
     fn bitrate_targets_survive_estimator_reset() {
         let mut bwe = Bwe::new(Bitrate::kbps(300));
         bwe.set_bitrate(Bitrate::kbps(800), Bitrate::mbps(3));
+        bwe.set_pacing_floor(Bitrate::mbps(1));
         bwe.reset(Bitrate::kbps(200));
         assert_eq!(bwe.minimum_bitrate(), Bitrate::kbps(800));
+        assert_eq!(bwe.pacing_floor(), Bitrate::mbps(1));
         assert_eq!(bwe.desired_bitrate, Bitrate::mbps(3));
         assert_eq!(bwe.last_estimate(), Some(Bitrate::kbps(200)));
     }

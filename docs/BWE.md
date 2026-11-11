@@ -744,6 +744,16 @@ rate by the congestion-controlled target after congestion-window pushback.
 str0m has no encoders or layer allocator: the application supplies the
 minimum transmit target, and str0m applies its estimate cap and overuse gate.
 
+`Bwe::set_pacing_floor(floor)` raises the pacing rate to
+`max(estimate, floor) × 1.1`, as libwebrtc paces at least at its
+`min_total_allocated_bitrate`. It is for an application that limits its
+media rate itself: pacing below that rate only queues packets, which the
+pacer then sends in a burst once their queue time exceeds the queue limit.
+The floor does not change the padding rate, probes or the estimate. Above
+about 11.5 Mbps (`MAX_BURST_SIZE / (PACING × 1.1)`) the pacer's burst limit
+of 63 kB, not the 40 ms pacing interval, bounds a burst, also when the
+floor rather than the estimate sets the pacing rate.
+
 The calculated pacing_rate and padding_rate flow to the Pacer, controlling
 transmission smoothing and padding generation respectively.
 

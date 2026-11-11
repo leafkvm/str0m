@@ -120,6 +120,28 @@ impl<'a> Bwe<'a> {
         m.no_events();
     }
 
+    /// Pace as if the estimate were at least `floor`.
+    ///
+    /// For an application that limits its media rate itself (an encoder capped at a
+    /// minimum quality, a fixed audio or video layer): pacing below that rate only queues
+    /// packets in the pacer, which then sends the queue in a burst once its queue time
+    /// limit is exceeded. With a floor, the pacing rate is `max(estimate, floor)` times the
+    /// pacing factor, as libWebRTC paces at least at its minimum total allocated bitrate.
+    ///
+    /// The floor raises the pacing rate only: padding, probes and the estimate are not
+    /// affected. Pacing above the estimate can send bursts above the path's capacity; the
+    /// pacer still limits a burst to its maximum burst size. Zero (the default) turns it off.
+    ///
+    /// This only has an effect when BWE is enabled via
+    /// [`RtcConfig::enable_bwe`][crate::RtcConfig::enable_bwe]. The floor is retained across
+    /// [`reset`][Self::reset].
+    pub fn set_pacing_floor(&mut self, floor: Bitrate) {
+        let mut m = self.0.mutate();
+        m.session.set_bwe_pacing_floor(floor);
+        // Only the pacer's rates change; no event is queued.
+        m.no_events();
+    }
+
     /// The estimator's current state, `None` when BWE is not enabled.
     ///
     /// See [`BweState`].

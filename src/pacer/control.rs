@@ -28,7 +28,9 @@ impl PacerControl {
     /// `minimum` is the application's minimum transmit rate, `loss_recovery` the rate the
     /// loss controller wants padded to while it increases a loss-limited estimate (zero
     /// otherwise). As libWebRTC's `GetPacingRates`, the padding rate is the larger of the two
-    /// (and the automatic target), capped by the estimate.
+    /// (and the automatic target), capped by the estimate. `pacing_floor` raises the pacing
+    /// rate only, as libWebRTC's `min_total_allocated_bitrate`: the pacer paces as if the
+    /// estimate were at least that.
     pub fn calculate(
         &self,
         has_active_media: bool,
@@ -36,6 +38,7 @@ impl PacerControl {
         is_overuse: bool,
         minimum: Bitrate,
         loss_recovery: Bitrate,
+        pacing_floor: Bitrate,
     ) -> PacingResult {
         let padding_rate = if is_overuse {
             // No padding during overuse
@@ -52,7 +55,7 @@ impl PacerControl {
         // Set pacing rate to smooth out media transmission (burst avoidance).
         // Must be at least the current BWE estimate * factor, but also high enough
         // to allow the padding we want to send.
-        let min_pacing_rate = estimate * PACING_FACTOR;
+        let min_pacing_rate = estimate.max(pacing_floor) * PACING_FACTOR;
         let pacing_rate = min_pacing_rate.max(padding_rate);
 
         PacingResult {
@@ -71,7 +74,14 @@ mod test {
         let c = PacerControl::new();
         let estimate = Bitrate::kbps(1_000);
 
-        let r = c.calculate(true, estimate, false, Bitrate::ZERO, Bitrate::ZERO);
+        let r = c.calculate(
+            true,
+            estimate,
+            false,
+            Bitrate::ZERO,
+            Bitrate::ZERO,
+            Bitrate::ZERO,
+        );
 
         assert_eq!(r.padding_rate, PADDING_TARGET);
     }
@@ -81,7 +91,14 @@ mod test {
         let c = PacerControl::new();
         let estimate = Bitrate::kbps(1_000);
 
-        let r = c.calculate(false, estimate, false, Bitrate::mbps(2), Bitrate::ZERO);
+        let r = c.calculate(
+            false,
+            estimate,
+            false,
+            Bitrate::mbps(2),
+            Bitrate::ZERO,
+            Bitrate::ZERO,
+        );
 
         assert_eq!(r.padding_rate, Bitrate::ZERO);
     }
@@ -91,7 +108,14 @@ mod test {
         let c = PacerControl::new();
         let estimate = Bitrate::mbps(40);
 
-        let r = c.calculate(true, estimate, true, Bitrate::mbps(2), Bitrate::ZERO);
+        let r = c.calculate(
+            true,
+            estimate,
+            true,
+            Bitrate::mbps(2),
+            Bitrate::ZERO,
+            Bitrate::ZERO,
+        );
         assert_eq!(r.padding_rate, Bitrate::ZERO);
     }
 
@@ -101,7 +125,14 @@ mod test {
         let minimum = Bitrate::kbps(800);
         // Both increasing and decreasing estimates must immediately change the cap.
         for (estimate, expected) in [(450, 450), (700, 700), (1000, 800), (300, 300)] {
-            let result = c.calculate(true, Bitrate::kbps(estimate), false, minimum, Bitrate::ZERO);
+            let result = c.calculate(
+                true,
+                Bitrate::kbps(estimate),
+                false,
+                minimum,
+                Bitrate::ZERO,
+                Bitrate::ZERO,
+            );
             assert_eq!(result.padding_rate, Bitrate::kbps(expected));
             assert_eq!(result.pacing_rate, Bitrate::kbps(estimate) * PACING_FACTOR);
         }
@@ -113,12 +144,26 @@ mod test {
         let estimate = Bitrate::kbps(1_000);
 
         // While the loss controller increases using padding: pad up to that rate.
-        let r = c.calculate(true, estimate, false, Bitrate::ZERO, estimate);
+        let r = c.calculate(
+            true,
+            estimate,
+            false,
+            Bitrate::ZERO,
+            estimate,
+            Bitrate::ZERO,
+        );
         assert_eq!(r.padding_rate, estimate);
         assert!(r.pacing_rate >= r.padding_rate);
 
         // Never below the normal padding target, nor the minimum.
-        let r = c.calculate(true, estimate, false, Bitrate::ZERO, Bitrate::kbps(20));
+        let r = c.calculate(
+            true,
+            estimate,
+            false,
+            Bitrate::ZERO,
+            Bitrate::kbps(20),
+            Bitrate::ZERO,
+        );
         assert_eq!(r.padding_rate, PADDING_TARGET);
         let r = c.calculate(
             true,
@@ -126,6 +171,7 @@ mod test {
             false,
             Bitrate::kbps(800),
             Bitrate::kbps(500),
+            Bitrate::ZERO,
         );
         assert_eq!(r.padding_rate, Bitrate::kbps(800));
         let r = c.calculate(
@@ -134,17 +180,56 @@ mod test {
             false,
             Bitrate::kbps(500),
             Bitrate::kbps(800),
+            Bitrate::ZERO,
         );
         assert_eq!(r.padding_rate, Bitrate::kbps(800));
 
         // Capped by the estimate and suppressed in overuse, as the minimum.
-        let r = c.calculate(true, estimate, false, Bitrate::ZERO, Bitrate::mbps(2));
+        let r = c.calculate(
+            true,
+            estimate,
+            false,
+            Bitrate::ZERO,
+            Bitrate::mbps(2),
+            Bitrate::ZERO,
+        );
         assert_eq!(r.padding_rate, estimate);
-        let r = c.calculate(true, estimate, true, Bitrate::ZERO, estimate);
+        let r = c.calculate(true, estimate, true, Bitrate::ZERO, estimate, Bitrate::ZERO);
         assert_eq!(r.padding_rate, Bitrate::ZERO);
 
         // Back to the normal padding target after the state.
-        let r = c.calculate(true, estimate, false, Bitrate::ZERO, Bitrate::ZERO);
+        let r = c.calculate(
+            true,
+            estimate,
+            false,
+            Bitrate::ZERO,
+            Bitrate::ZERO,
+            Bitrate::ZERO,
+        );
+        assert_eq!(r.padding_rate, PADDING_TARGET);
+    }
+
+    #[test]
+    fn pacing_floor_raises_pacing_rate_only() {
+        let c = PacerControl::new();
+        let estimate = Bitrate::kbps(500);
+        let floor = Bitrate::mbps(2);
+
+        let r = c.calculate(true, estimate, false, Bitrate::mbps(1), estimate, floor);
+        assert_eq!(r.pacing_rate, floor * PACING_FACTOR);
+        // The padding stays capped by the estimate, not by the floor.
+        assert_eq!(r.padding_rate, estimate);
+
+        // A floor below the estimate changes nothing.
+        let r = c.calculate(
+            true,
+            estimate,
+            false,
+            Bitrate::ZERO,
+            Bitrate::ZERO,
+            Bitrate::kbps(100),
+        );
+        assert_eq!(r.pacing_rate, estimate * PACING_FACTOR);
         assert_eq!(r.padding_rate, PADDING_TARGET);
     }
 
@@ -152,7 +237,14 @@ mod test {
     fn automatic_padding_is_also_capped_by_estimate() {
         let c = PacerControl::new();
         for estimate in [Bitrate::ZERO, Bitrate::kbps(20)] {
-            let result = c.calculate(true, estimate, false, Bitrate::ZERO, Bitrate::ZERO);
+            let result = c.calculate(
+                true,
+                estimate,
+                false,
+                Bitrate::ZERO,
+                Bitrate::ZERO,
+                Bitrate::ZERO,
+            );
             assert_eq!(result.padding_rate, estimate);
         }
     }

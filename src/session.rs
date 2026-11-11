@@ -1413,6 +1413,13 @@ impl Session {
         }
     }
 
+    pub fn set_bwe_pacing_floor(&mut self, floor: Bitrate) {
+        if let Some(bwe) = self.bwe.as_mut() {
+            bwe.set_pacing_floor(floor);
+            self.configure_pacer();
+        }
+    }
+
     pub fn bwe_state(&self) -> Option<crate::bwe::BweState> {
         self.bwe.as_ref().map(|bwe| bwe.state())
     }
@@ -1454,6 +1461,7 @@ impl Session {
         let is_overuse = bwe.is_overusing();
         let minimum = bwe.minimum_bitrate();
         let loss_recovery = bwe.loss_recovery_padding_rate();
+        let pacing_floor = bwe.pacing_floor();
 
         let has_active_media = self.has_active_outgoing_media();
 
@@ -1464,6 +1472,7 @@ impl Session {
             is_overuse,
             minimum,
             loss_recovery,
+            pacing_floor,
         );
 
         self.pacer.set_padding_rate(result.padding_rate);

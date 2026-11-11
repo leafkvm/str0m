@@ -10,6 +10,7 @@ mod delay;
 mod estimate;
 mod loss;
 mod minimum;
+mod pacing_floor;
 mod probes;
 mod queue_time;
 mod recovery;

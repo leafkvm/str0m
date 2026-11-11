@@ -1,5 +1,6 @@
 # Unreleased
 
+  * Add `Bwe::set_pacing_floor()` to pace at least at a rate the application already limits its media to
   * Add `Bwe::state()`, a snapshot of the send-side estimator's state
   * Stop writing the delay-based estimate into the loss controller's loss model
   * Remove the ALR link-capacity cap on loss-based candidates, which libwebrtc does not have

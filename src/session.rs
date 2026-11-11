@@ -1413,6 +1413,10 @@ impl Session {
         }
     }
 
+    pub fn bwe_state(&self) -> Option<crate::bwe::BweState> {
+        self.bwe.as_ref().map(|bwe| bwe.state())
+    }
+
     pub fn reset_bwe(&mut self, init_bitrate: Bitrate) {
         if let Some(bwe) = self.bwe.as_mut() {
             bwe.reset(init_bitrate);

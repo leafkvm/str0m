@@ -106,6 +106,12 @@ pacer behavior. Throughout operation, it tracks ALR (Application Limited
 Region) state by forwarding information to probe control and loss
 controller.
 
+`Bwe::state()` returns a read-only snapshot of these internals for the
+application: the unsmoothed estimate, the acknowledged bitrate, the delay
+detector's overuse hypothesis, the ALR state, whether the loss-based
+estimate limits the estimate, whether the loss controller increases using
+padding, and the delay-based estimate alone.
+
 ### Delay Controller
 
 **Location:** `src/bwe/delay/control.rs`

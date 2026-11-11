@@ -130,6 +130,21 @@ impl Bwe {
         self.minimum_bitrate
     }
 
+    /// A read-only snapshot of the estimator's state.
+    pub fn state(&self) -> api::BweState {
+        let b = &self.bwe;
+        api::BweState {
+            estimate: b.last_estimate(),
+            acked: b.acked_bitrate_estimator.current_estimate(),
+            overusing: b.is_overusing(),
+            application_limited: b.alr_detector.alr_start_time().is_some(),
+            loss_limited: b.is_loss_limited(),
+            increase_using_padding: b.loss_controller.loss_based_result().state
+                == LossControllerState::IncreaseUsingPadding,
+            delay_estimate: b.delay_controller.last_estimate(),
+        }
+    }
+
     /// The rate the pacer should pad up to while the loss controller recovers, zero otherwise.
     pub fn loss_recovery_padding_rate(&self) -> Bitrate {
         let Some(estimate) = self.bwe.last_estimate() else {
@@ -781,6 +796,10 @@ mod test {
             bwe.bandwidth_limited_cause(),
             BandwidthLimitedCause::DelayBasedLimited
         );
+        let state = with_estimator(bwe).state();
+        assert!(!state.loss_limited, "{state:?}");
+        assert_eq!(state.estimate, Some(delay));
+        assert_eq!(state.delay_estimate, Some(delay));
     }
 
     #[test]
@@ -798,6 +817,17 @@ mod test {
             bwe.bandwidth_limited_cause(),
             BandwidthLimitedCause::LossLimitedBwe | BandwidthLimitedCause::LossLimitedBweIncreasing
         ));
+        let state = with_estimator(bwe).state();
+        assert!(state.loss_limited, "{state:?}");
+        assert_eq!(state.estimate, Some(loss_estimate));
+        assert_eq!(state.delay_estimate, Some(delay));
+    }
+
+    /// A `Bwe` around `bwe`.
+    fn with_estimator(bwe: SendSideBandwidthEstimator) -> Bwe {
+        let mut b = Bwe::new(Bitrate::kbps(300));
+        b.bwe = bwe;
+        b
     }
 
     #[test]

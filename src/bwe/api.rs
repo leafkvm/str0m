@@ -36,6 +36,35 @@ pub enum BweKind {
     },
 }
 
+/// Snapshot of the send-side estimator's state, from [`Bwe::state`].
+///
+/// Read-only: the values the estimator already computes, for an application that adapts
+/// its own sending (for example an encoder rate controller) and wants to know why the
+/// estimate is where it is.
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[non_exhaustive]
+pub struct BweState {
+    /// The current estimate, unsmoothed (what
+    /// [`Event::EgressBitrateEstimate`][crate::Event::EgressBitrateEstimate] averages when
+    /// smoothing is on).
+    pub estimate: Option<Bitrate>,
+    /// The acknowledged bitrate: what the receiver reports to have received.
+    pub acked: Option<Bitrate>,
+    /// The delay-based detector's hypothesis is overuse.
+    pub overusing: bool,
+    /// The ALR detector says the sender is application limited.
+    pub application_limited: bool,
+    /// The loss-based estimate limits the estimate: the loss controller is not deferring to
+    /// the delay controller and its estimate is below the delay-based one.
+    pub loss_limited: bool,
+    /// The loss controller increases a loss-limited estimate and the pacer pads up to it
+    /// (libWebRTC's `kIncreaseUsingPadding`). Implies `loss_limited`, except while the
+    /// delay-based estimate is below the loss-based one.
+    pub increase_using_padding: bool,
+    /// The delay-based estimate alone (what `estimate` would be without the loss controller).
+    pub delay_estimate: Option<Bitrate>,
+}
+
 /// Access to the Bandwidth Estimate subsystem.
 ///
 // The inner `RtcMut` arms the readiness on mutable deref only; see `crate::poll`.
@@ -89,6 +118,13 @@ impl<'a> Bwe<'a> {
         // Reconfiguring BWE only re-arms the estimator/pacer timers; any probing
         // padding is produced later from the timeout path, so no event is queued.
         m.no_events();
+    }
+
+    /// The estimator's current state, `None` when BWE is not enabled.
+    ///
+    /// See [`BweState`].
+    pub fn state(&self) -> Option<BweState> {
+        self.0.session.bwe_state()
     }
 
     /// Reset the BWE with a new init_bitrate

@@ -67,10 +67,15 @@ impl AckedBitrateEstimator {
         let sample_estimate_bps = sample_estimate.as_f64();
         let estimate_bps = estimate.as_f64();
         // Define the sample uncertainty as a function of how far away it is from the
-        // current estimate. With low values of uncertainty_symmetry_cap_ we add more
-        // uncertainty to increases than to decreases. For higher values we approach
-        // symmetry.
-        let sample_uncertainty = scale * (estimate_bps - sample_estimate_bps).abs() / estimate_bps;
+        // current estimate, relative to the larger of the two. Relative to the estimate
+        // alone (libwebrtc's default, uncertainty_symmetry_cap 0) the uncertainty of an
+        // increase has no bound: after a long run of low samples, e.g. only padding while
+        // no media is sent, the estimate settles there with a variance near zero and a
+        // sample many times larger gets almost no weight, so the estimate stays near the
+        // old rate for many seconds after the rate went up. Relative to the larger one
+        // the uncertainty is symmetric and at most `scale`. Decreases are unchanged.
+        let sample_uncertainty = scale * (estimate_bps - sample_estimate_bps).abs()
+            / estimate_bps.max(sample_estimate_bps);
         let sample_var = sample_uncertainty.powf(2.0);
 
         // Update a bayesian estimate of the rate, weighting it lower if the sample
@@ -199,6 +204,79 @@ mod test {
             108320,
             "AckedBitrateEstiamtor should produce the correct bitrate"
         );
+    }
+
+    /// Feeds `size`-byte packets at `rate` from `start` for `dur`; returns the end time.
+    fn feed(
+        e: &mut AckedBitrateEstimator,
+        start: Instant,
+        dur: Duration,
+        rate: Bitrate,
+        size: DataSize,
+    ) -> Instant {
+        let step = size / rate;
+        let mut t = start;
+        while t < start + dur {
+            e.update(t, size);
+            t += step;
+        }
+        t
+    }
+
+    /// ~8 Mbit/s of media, then 20 s in which only the pacer's 50 kbit/s padding (240 byte
+    /// packets) and an ALR probe every 5 s (the last one `probe_lead` before media resumes) are
+    /// acked, as while a source sends no media, then ~8 Mbit/s again. Returns the estimate
+    /// just before resuming and 1 s after.
+    fn gap_then_resume(probe_lead: Duration) -> (Bitrate, Bitrate) {
+        let rate = Bitrate::kbps(8000);
+        let mtu = DataSize::bytes(1200);
+        let padding = (Bitrate::kbps(50), DataSize::bytes(240));
+        let mut e =
+            AckedBitrateEstimator::new(Duration::from_millis(500), Duration::from_millis(150));
+        let mut t = feed(&mut e, Instant::now(), Duration::from_secs(3), rate, mtu);
+        for _ in 0..4 {
+            t = feed(
+                &mut e,
+                t,
+                Duration::from_secs(5) - probe_lead,
+                padding.0,
+                padding.1,
+            );
+            // ALR probe: 15 ms at 20 Mbit/s.
+            t = feed(
+                &mut e,
+                t,
+                Duration::from_millis(15),
+                Bitrate::kbps(20_000),
+                mtu,
+            );
+            t = feed(&mut e, t, probe_lead, padding.0, padding.1);
+        }
+        let in_gap = e.current_estimate().unwrap();
+        let resumed = t;
+        while t < resumed + Duration::from_secs(1) {
+            t = feed(&mut e, t, Duration::from_millis(100), rate, mtu);
+            println!(
+                "lead {probe_lead:?}: {:>4} ms after resume: {}",
+                (t - resumed).as_millis(),
+                e.current_estimate().unwrap()
+            );
+        }
+        (in_gap, e.current_estimate().unwrap())
+    }
+
+    #[test]
+    fn test_recovers_after_media_gap_with_padding() {
+        let rate = Bitrate::kbps(8000);
+        for lead in [Duration::from_millis(2500), Duration::from_millis(300)] {
+            let (in_gap, at_1s) = gap_then_resume(lead);
+            println!("lead {lead:?}: in gap {in_gap}, 1 s after resume {at_1s}");
+            let err = (at_1s.as_f64() - rate.as_f64()).abs() / rate.as_f64();
+            assert!(
+                err < 0.2,
+                "probe lead {lead:?}: estimate {at_1s} not within 20 % of {rate} 1 s after the gap"
+            );
+        }
     }
 
     #[test]

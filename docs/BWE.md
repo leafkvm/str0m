@@ -804,6 +804,22 @@ transmission smoothing and padding generation respectively.
    - **Impact**: Audio-only and pre-media connections can probe within the same
      congestion-control limits, provided a sending section supports TWCC
 
+7. **Acknowledged Bitrate Sample Uncertainty:**
+   - **WebRTC**: `BitrateEstimator` weighs each sample by an uncertainty of
+     `scale × |estimate − sample| / estimate` (its default
+     `uncertainty_symmetry_cap` of zero), which has no bound for a sample
+     above the estimate
+   - **str0m**: `scale × |estimate − sample| / max(estimate, sample)`: the
+     same for a sample below the estimate, at most `scale` for one above it
+   - **Reason**: After a media gap only the 50 kbps padding is acknowledged,
+     and the estimate settles there with a variance near zero. When media
+     resumes at several Mbps the unbounded uncertainty lets each 150 ms
+     window move the estimate by tens of bit/s, holding the acknowledged
+     bitrate, and everything bounded by it, down for many seconds
+   - **Impact**: Increases are followed within about a second (2 → 16 Mbps
+     to within 10 %: 907 ms instead of 2703 ms); decreases are computed as
+     before, and the steady-state spread is the same
+
 ### Shared with WebRTC
 
 - Core delay-based detection algorithm (trendline estimator with AIMD rate
@@ -820,7 +836,8 @@ transmission smoothing and padding generation respectively.
 - Arrival group formation rules
 - Probe bitrate estimation (send/recv rate calculation and ratio
   validation)
-- Acked bitrate estimation (Bayesian smoothing)
+- Acked bitrate estimation (Bayesian smoothing; the sample uncertainty of
+  an increase is bounded, see Deviations)
 - Loss-based estimation with ALR integration and link capacity tracking
 - ALR detection for probe scheduling and loss controller bounds
 

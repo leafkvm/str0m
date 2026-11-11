@@ -1,5 +1,6 @@
 # Unreleased
 
+  * Bound the acked bitrate's sample uncertainty for increases, so it recovers after a media gap
   * Allow disabling BWE estimate smoothing #1119
 
 # 0.25.0

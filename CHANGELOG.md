@@ -1,5 +1,6 @@
 # Unreleased
 
+  * Start the BWE estimate smoother at the first measurement, not at the configured initial bitrate; a `Bwe::reset` emits its bitrate once and starts smoothing afresh
   * Add `Bwe::set_pacing_floor()` to pace at least at a rate the application already limits its media to
   * Add `Bwe::state()`, a snapshot of the send-side estimator's state
   * Stop writing the delay-based estimate into the loss controller's loss model

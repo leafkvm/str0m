@@ -11,23 +11,54 @@ type TimeBitrate = (Instant, Bitrate);
 const TOLERANCE: f64 = 0.05;
 
 /// Smooths BWE estimates by averaging over a time window.
+///
+/// The value the estimator starts from (the configured initial bitrate, or the one given to a
+/// reset) is a guess, not a measurement: it is not averaged. The window starts at the first
+/// estimate that differs from it, which only feedback produces.
 pub struct EstimateSmoother {
     estimates: VecDeque<TimeBitrate>,
+    start: Bitrate,
+    /// Restarted, the start value not recorded yet.
+    restarted: bool,
     maybe_emit: bool,
     emitted: Option<Bitrate>,
 }
 
 impl EstimateSmoother {
-    pub fn new() -> Self {
+    /// A smoother for an estimator starting at `start`. The start value is not emitted: the
+    /// session reports it when probing becomes available.
+    pub fn new(start: Bitrate) -> Self {
         Self {
             estimates: VecDeque::new(),
+            start,
+            restarted: false,
             maybe_emit: false,
             emitted: None,
         }
     }
 
+    /// Start again from `start` for an estimator reset to it: the window is cleared, and the
+    /// start value is emitted once, on its own, from the next [`record`][Self::record] on.
+    pub fn restart(&mut self, start: Bitrate) {
+        self.estimates.clear();
+        self.start = start;
+        self.restarted = true;
+        self.maybe_emit = false;
+    }
+
     /// Record a new estimate and update the smoothed average.
     pub fn record(&mut self, now: Instant, estimate: Bitrate) {
+        if self.restarted {
+            self.restarted = false;
+            self.maybe_emit = true;
+            self.emitted = None;
+        }
+
+        // Still at the start value: no measurement yet.
+        if self.estimates.is_empty() && estimate == self.start {
+            return;
+        }
+
         // Did value change from previous?
         let do_update = self.estimates.back().map(|b| b.1) != Some(estimate);
 
@@ -58,7 +89,12 @@ impl EstimateSmoother {
             return None;
         }
 
-        let &(_, latest) = self.estimates.back()?;
+        let Some(&(_, latest)) = self.estimates.back() else {
+            // Restarted, no measurement yet.
+            self.maybe_emit = false;
+            self.emitted = Some(self.start);
+            return Some(self.start);
+        };
 
         let rate: Bitrate = if smoothing {
             let total: f64 = self.estimates.iter().map(|b| b.1.as_f64()).sum();
@@ -101,7 +137,7 @@ mod test {
     use super::*;
 
     fn emitted(smoothing: bool, steps: &[(u64, u64)]) -> Vec<Option<Bitrate>> {
-        let mut smoother = EstimateSmoother::new();
+        let mut smoother = EstimateSmoother::new(Bitrate::ZERO);
         let now = Instant::now();
         steps
             .iter()

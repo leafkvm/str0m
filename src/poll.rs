@@ -243,9 +243,14 @@ mod tests {
     use std::time::Instant;
 
     fn idle_rtc() -> Rtc {
+        idle_rtc_with(true)
+    }
+
+    fn idle_rtc_with(bwe_smoothing: bool) -> Rtc {
         let now = Instant::now();
         let mut rtc = Rtc::builder()
             .enable_bwe(Some(Bitrate::kbps(300)))
+            .set_bwe_smoothing(bwe_smoothing)
             .build(now);
         let profile = SrtpProfile::AEAD_AES_128_GCM;
         let mat = KeyingMaterial::new(&vec![0; profile.keying_material_len()]);
@@ -302,6 +307,32 @@ mod tests {
         );
         let expected = rtc.poll_timeout();
         assert!(matches!(rtc.poll_output().unwrap(), Output::Timeout(at) if at == expected));
+    }
+
+    #[test]
+    fn bwe_reset_estimate_follows_on_a_later_timeout() {
+        for smoothing in [true, false] {
+            let mut rtc = idle_rtc_with(smoothing);
+            rtc.bwe().reset(Bitrate::kbps(900));
+            let mut estimates = vec![];
+            for _ in 0..20 {
+                match rtc.poll_output().unwrap() {
+                    Output::Timeout(at) => rtc.handle_input(Input::Timeout(at)).unwrap(),
+                    Output::Event(crate::Event::EgressBitrateEstimate(kind)) => {
+                        estimates.push(kind)
+                    }
+                    _ => {}
+                }
+            }
+            assert_eq!(
+                estimates,
+                [crate::bwe::BweKind::Twcc {
+                    estimate: Bitrate::kbps(900),
+                    can_probe: true
+                }],
+                "smoothing {smoothing}"
+            );
+        }
     }
 
     #[test]

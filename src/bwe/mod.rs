@@ -68,7 +68,7 @@ impl Bwe {
             desired_bitrate: Bitrate::ZERO,
             minimum_bitrate: Bitrate::ZERO,
             pacing_floor: Bitrate::ZERO,
-            smoother: EstimateSmoother::new(),
+            smoother: EstimateSmoother::new(initial),
         }
     }
 
@@ -90,6 +90,7 @@ impl Bwe {
 
     pub fn reset(&mut self, init_bitrate: Bitrate) {
         self.bwe.reset(init_bitrate);
+        self.smoother.restart(init_bitrate);
     }
 
     pub fn update<'t>(
@@ -660,6 +661,20 @@ mod test {
             send: Bitrate,
             link: Bitrate,
         ) {
+            self.run_with(secs, send, link, |report, now| {
+                bwe.update(report.iter(), now);
+                let _ = bwe.handle_timeout(Bitrate::mbps(10), true, now);
+            });
+        }
+
+        /// As `run`, handing each report to `feed` with the time it arrives.
+        fn run_with(
+            &mut self,
+            secs: f64,
+            send: Bitrate,
+            link: Bitrate,
+            mut feed: impl FnMut(&[TwccSendRecord], Instant),
+        ) {
             let size = DataSize::bytes(1200);
             let end = self.t + Duration::from_secs_f64(secs);
             while self.t < end {
@@ -687,8 +702,7 @@ mod test {
                         TwccSendRecord::test_new(id, sent, 1200, now, (!lost).then_some(recv))
                     })
                     .collect();
-                bwe.update(report.iter(), now);
-                let _ = bwe.handle_timeout(Bitrate::mbps(10), true, now);
+                feed(&report, now);
                 self.next_report = now + Duration::from_millis(50);
             }
         }
@@ -950,6 +964,57 @@ mod test {
         assert!(overused, "the dip should be an overuse");
         assert_eq!(loss_limited, None, "loss limited after the overuse");
         assert_eq!(estimate, delay);
+    }
+
+    #[test]
+    fn smoothed_estimate_starts_at_the_first_measurement() {
+        // A 60 Mbps initial guess; the sender sends 3 Mbps into a 2 Mbps link until the
+        // overuse cuts the estimate, the first one that is not the guess.
+        let mut bwe = Bwe::new(Bitrate::mbps(60));
+        let mut link = Link::new();
+        let (mut estimates, mut events) = (vec![], vec![]);
+        link.run_with(4.0, Bitrate::mbps(3), Bitrate::mbps(2), |report, now| {
+            bwe.update(report.iter(), now);
+            let _ = bwe.handle_timeout(now, true);
+            estimates.push(bwe.last_estimate().unwrap());
+            if let Some(e) = bwe.poll_estimate(true) {
+                events.push(e);
+            }
+        });
+        let first_measured = *estimates
+            .iter()
+            .find(|e| **e != Bitrate::mbps(60))
+            .expect("the overuse cuts the estimate");
+        println!("first measured {first_measured}, events {events:?}");
+        assert!(first_measured < Bitrate::mbps(10));
+        // No event for the initial guess, and the first one is the measurement itself, not
+        // its mean with the guess.
+        assert_eq!(events.first(), Some(&first_measured));
+        assert!(events.iter().all(|e| *e < Bitrate::mbps(10)), "{events:?}");
+    }
+
+    #[test]
+    fn reset_value_is_emitted_once() {
+        for smoothing in [true, false] {
+            // Feedback moves the estimate off its initial value, then the application resets.
+            let mut bwe = Bwe::new(Bitrate::mbps(60));
+            let mut link = Link::new();
+            link.run_with(4.0, Bitrate::mbps(3), Bitrate::mbps(2), |report, now| {
+                bwe.update(report.iter(), now);
+                let _ = bwe.handle_timeout(now, true);
+                let _ = bwe.poll_estimate(smoothing);
+            });
+            bwe.reset(Bitrate::mbps(5));
+            let start = link.start + link.t;
+            let mut events = vec![];
+            for ms in (0..4000).step_by(50) {
+                let _ = bwe.handle_timeout(start + Duration::from_millis(ms), true);
+                if let Some(e) = bwe.poll_estimate(smoothing) {
+                    events.push(e);
+                }
+            }
+            assert_eq!(events, [Bitrate::mbps(5)], "smoothing {smoothing}");
+        }
     }
 
     #[test]

@@ -13,8 +13,12 @@ pub enum BweKind {
     ///
     /// Emits the current estimate with `can_probe: true` when probing becomes
     /// available, initially using the configured starting bitrate. Estimate
-    /// updates follow while probing is available. On loss of probing capability,
-    /// emits the last reported estimate once with `can_probe: false`, then
+    /// updates follow while probing is available, from the first measured estimate
+    /// on: the starting bitrate is a configured guess and is not averaged into
+    /// smoothed updates. After [`Bwe::reset`] the new starting bitrate is emitted
+    /// once, on a later timeout, and smoothing starts again at the first measured
+    /// estimate after it, without the estimates before the reset. On loss of probing
+    /// capability, emits the last reported estimate once with `can_probe: false`, then
     /// suppresses updates until probing becomes available again.
     Twcc {
         /// Estimated available bitrate. Initially this is the configured starting bitrate.
